@@ -1,10 +1,8 @@
 package com.genymobile.scrcpy.audio
 
-import android.annotation.TargetApi
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.os.Build
-import androidx.annotation.RequiresApi
 import com.genymobile.scrcpy.AndroidVersions
 import com.genymobile.scrcpy.AsyncProcessor
 import com.genymobile.scrcpy.Options
@@ -29,11 +27,14 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import java.io.IOException
-import java.nio.ByteBuffer
 
 /**
  * 音频编码器 (协程版本)
- *
+ *  audioEncoder编码音频  输入缓冲区可用(编码器内部的输入缓冲区有空闲) ---> 记录index到inputTask队列中 ---> 编码 ----> 输出缓冲区可用(getOutputBuffer)----> index和编码结果写入output队列中
+ *  1. createMediaCodec
+ *  2. 设置MediaCodec 回调 (通过channel发送任务通知协程)
+ *  3. 输入pcm编码 mediaCodec.queueInputBuffer (读取channel协程运行)
+ *  4. 读取发送  mediaCodec.getOutputBuffer(task.index)  (读取channel协程运行)
  * 使用 MediaCodec 对音频进行编码，采用协程替代多线程模型。
  * 使用 Channel 实现生产者-消费者模式，处理输入和输出缓冲区。
  *
@@ -41,6 +42,7 @@ import java.nio.ByteBuffer
  * @property streamer 网络流传输器
  * @property options 编码选项
  */
+
 class AudioEncoder(
     private val capture: AudioCapture,
     private val streamer: Streamer,

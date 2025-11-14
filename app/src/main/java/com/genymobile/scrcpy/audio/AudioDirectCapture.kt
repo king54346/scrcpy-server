@@ -23,7 +23,7 @@ import java.nio.ByteBuffer
  * 录制设备正在播放的声音(内录)
  *
  * 关键特性:
- * - 支持 Android 11+ 的前台录音要求
+ * - 支持 Android 11 的前台录音要求, Android 12+ 直接启动录音要求
  * - 处理特定设备(如 Vivo)的兼容性问题
  * - 提供自动重试机制
  */
