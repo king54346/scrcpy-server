@@ -399,9 +399,11 @@ class AudioEncoder(
             if (encoderName != null) {
                 Ln.d("Creating audio encoder by name: '$encoderName'")
                 try {
+                    // 1. 按名称创建编码器
                     val mediaCodec = MediaCodec.createByCodecName(encoderName)
+                    // 2. 获取支持的编码器类型
                     val mimeType = Codec.getMimeType(mediaCodec)
-
+                    // 3. 验证 MIME 类型是否匹配
                     if (codec.mimeType != mimeType) {
                         val message = "Audio encoder type for \"$encoderName\" " +
                                 "($mimeType) does not match codec type (${codec.mimeType})"
@@ -411,6 +413,7 @@ class AudioEncoder(
 
                     return mediaCodec
                 } catch (e: IllegalArgumentException) {
+                    // 编码器名称不存在
                     val message = """
                         Audio encoder '$encoderName' for ${codec.codecName} not found
                         ${buildAudioEncoderListMessage()}
@@ -418,6 +421,7 @@ class AudioEncoder(
                     Ln.e(message)
                     throw ConfigurationException("Unknown encoder: $encoderName")
                 } catch (e: IOException) {
+                    // 编码器创建失败(硬件问题)
                     val message = """
                         Could not create audio encoder '$encoderName' for ${codec.codecName}
                         ${buildAudioEncoderListMessage()}
@@ -427,7 +431,7 @@ class AudioEncoder(
                 }
             }
 
-            // 使用默认编码器
+            // 使用默认编码器 opus
             try {
                 val mediaCodec = MediaCodec.createEncoderByType(codec.mimeType!!)
                 Ln.d("Using audio encoder: '${mediaCodec.name}'")
