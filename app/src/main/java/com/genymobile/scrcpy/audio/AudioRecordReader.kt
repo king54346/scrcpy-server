@@ -14,7 +14,6 @@ class AudioRecordReader(private val recorder: AudioRecord) {
     private var previousPts: Long = 0
     private var nextPts: Long = 0
 
-    @TargetApi(AndroidVersions.API_24_ANDROID_7_0)
     fun read(outDirectBuffer: ByteBuffer, outBufferInfo: MediaCodec.BufferInfo): Int {
         val r = recorder.read(outDirectBuffer, AudioConfig.MAX_READ_SIZE)
         if (r <= 0) {
