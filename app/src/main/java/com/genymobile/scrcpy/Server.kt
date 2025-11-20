@@ -55,7 +55,7 @@ object Server {
 
     @RequiresApi(Build.VERSION_CODES.Q)
     @Throws(Exception::class)
-    private fun internalMain(args: Array<String>) {
+    private suspend fun internalMain(args: Array<String>) {
         setupUncaughtExceptionHandler()
         prepareMainLooper()
 
@@ -82,7 +82,7 @@ object Server {
     //    3. Looper.loop() 等待完成
     @RequiresApi(Build.VERSION_CODES.Q)
     @Throws(IOException::class, ConfigurationException::class)
-    private fun scrcpy(options: Options) {
+    private suspend fun scrcpy(options: Options) {
         validateOptions(options)
         // cleanup monitor 进程
         val cleanUp = if (options.cleanup) CleanUp.start(options) else null
@@ -245,7 +245,7 @@ object Server {
     }
 
     @RequiresApi(Build.VERSION_CODES.Q)
-    private fun cleanupResources(
+    private suspend fun cleanupResources(
         connection: DesktopConnection,
         cleanUp: CleanUp?
     ) {

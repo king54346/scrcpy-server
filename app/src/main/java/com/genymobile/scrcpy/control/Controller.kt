@@ -86,8 +86,7 @@ class Controller(
     private val clipboardAutosync = options.clipboardAutosync
     private val powerOn = options.powerOn
 
-    private val charMap: KeyCharacterMap = KeyCharacterMap.load(KeyCharacterMap.VIRTUAL_KEYBOARD)
-
+    val charMap = KeyCharacterMap.load(KeyCharacterMap.VIRTUAL_KEYBOARD)
     private val isSettingClipboard = AtomicBoolean()
 
     private val displayData = AtomicReference<DisplayData>()
@@ -246,6 +245,7 @@ class Controller(
         }
 
         when (msg.type) {
+            // 英文字母
             ControlMessage.TYPE_INJECT_KEYCODE -> if (supportsInputEvents) {
                 injectKeycode(
                     msg.action,
@@ -254,7 +254,7 @@ class Controller(
                     msg.metaState
                 )
             }
-
+            //
             ControlMessage.TYPE_INJECT_TEXT -> if (supportsInputEvents) {
                 injectText(msg.text)
             }
@@ -337,9 +337,9 @@ class Controller(
         }
         return injectKeyEvent(action, keycode, repeat, metaState, Device.INJECT_MODE_ASYNC)
     }
-
+    // 数字键等
     private fun injectChar(c: Char): Boolean {
-        val decomposed: String = KeyComposition.decompose(c).toString()
+        val decomposed: String = KeyComposition.decompose(c) ?: c.toString()
         val chars = decomposed.toCharArray()
         val events = charMap.getEvents(chars) ?: return false
 

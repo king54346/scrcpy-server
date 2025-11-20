@@ -1,36 +1,36 @@
 package com.genymobile.scrcpy.wrappers
 
 import android.annotation.SuppressLint
-import android.hardware.input.InputManager as AndroidInputManager
 import android.view.InputEvent
 import android.view.MotionEvent
 import androidx.annotation.RequiresApi
 import com.genymobile.scrcpy.AndroidVersions
 import com.genymobile.scrcpy.FakeContext
-import com.genymobile.scrcpy.util.Ln
+import com.genymobile.scrcpy.util.Ln.e
 import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Method
+import android.hardware.input.InputManager as AndroidInputManager
 
 @SuppressLint("PrivateApi", "DiscouragedPrivateApi")
 class InputManager private constructor(private val manager: AndroidInputManager) {
 
     private var lastPermissionLogDate: Long = 0
 
-    fun injectInputEvent(inputEvent: InputEvent, mode: Int): Boolean {
-        return try {
+    fun injectInputEvent(inputEvent: InputEvent?, mode: Int): Boolean {
+        try {
             val method = getInjectInputEventMethod()
-            method.invoke(manager, inputEvent, mode) as Boolean
+            return method.invoke(manager, inputEvent, mode) as Boolean
         } catch (e: ReflectiveOperationException) {
             if (e is InvocationTargetException) {
                 val cause = e.cause
                 if (cause is SecurityException) {
-                    val message = cause.message
+                    val message = e.cause!!.message
                     if (message != null && message.contains("INJECT_EVENTS permission")) {
                         // Do not flood the console, limit to one permission error log every 3 seconds
                         val now = System.currentTimeMillis()
                         if (lastPermissionLogDate <= now - 3000) {
-                            Ln.e(message)
-                            Ln.e("Make sure you have enabled \"USB debugging (Security Settings)\" and then rebooted your device.")
+                            e(message)
+                            e("Make sure you have enabled \"USB debugging (Security Settings)\" and then rebooted your device.")
                             lastPermissionLogDate = now
                         }
                         // Do not print the stack trace
@@ -38,8 +38,8 @@ class InputManager private constructor(private val manager: AndroidInputManager)
                     }
                 }
             }
-            Ln.e("Could not invoke method", e)
-            false
+            e("Could not invoke method", e)
+            return false
         }
     }
 
@@ -49,7 +49,7 @@ class InputManager private constructor(private val manager: AndroidInputManager)
             val method = getAddUniqueIdAssociationByPortMethod()
             method.invoke(manager, inputPort, uniqueId)
         } catch (e: ReflectiveOperationException) {
-            Ln.e("Cannot add unique id association by port", e)
+            e("Cannot add unique id association by port", e)
         }
     }
 
@@ -59,7 +59,7 @@ class InputManager private constructor(private val manager: AndroidInputManager)
             val method = getRemoveUniqueIdAssociationByPortMethod()
             method.invoke(manager, inputPort)
         } catch (e: ReflectiveOperationException) {
-            Ln.e("Cannot remove unique id association by port", e)
+            e("Cannot remove unique id association by port", e)
         }
     }
 
@@ -111,7 +111,7 @@ class InputManager private constructor(private val manager: AndroidInputManager)
                 method.invoke(inputEvent, displayId)
                 true
             } catch (e: ReflectiveOperationException) {
-                Ln.e("Cannot associate a display id to the input event", e)
+                e("Cannot associate a display id to the input event", e)
                 false
             }
         }
@@ -134,7 +134,7 @@ class InputManager private constructor(private val manager: AndroidInputManager)
                 method.invoke(motionEvent, actionButton)
                 true
             } catch (e: ReflectiveOperationException) {
-                Ln.e("Cannot set action button on MotionEvent", e)
+                e("Cannot set action button on MotionEvent", e)
                 false
             }
         }

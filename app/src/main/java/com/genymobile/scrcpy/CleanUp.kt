@@ -11,66 +11,57 @@ import com.genymobile.scrcpy.util.Ln
 import com.genymobile.scrcpy.util.Settings
 import com.genymobile.scrcpy.util.SettingsException
 import com.genymobile.scrcpy.wrappers.ServiceManager
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
 import java.io.File
 import java.io.IOException
 import java.io.OutputStream
 
 /**
- * 清理守护进程
- *
- * 负责在主进程被杀死后恢复设备设置。
- * 通过创建独立进程监听主进程状态，确保即使在 USB 断开等极端情况下也能正确清理。
- *主进程 (scrcpy server)           子进程 (cleanup monitor)
- *     |                                     |
- *     | 启动时修改设置                        |
- *     | 创建子进程 ----------------->        |
- *     | 保持管道连接                          | 监听管道
- *     |                                    |
- *     | 被杀死 ✗                            |
- *     | 管道关闭 ------------------>        | 检测到管道关闭
- *                                         | 恢复所有设置 ✓
- * 工作原理:
- * 1. 主进程启动时修改设备设置(如显示触摸点、保持唤醒等)并记录原值
- * 2. 创建独立的子进程监听主进程的 stdout 管道
- * 3. 主进程死亡时管道关闭，子进程检测到后恢复所有设置
+ * 清理守护进程 (协程版本)
  */
 @RequiresApi(Build.VERSION_CODES.Q)
 class CleanUp private constructor(options: Options) {
-    // 待处理的动态变更标志位
-    private var pendingChanges = 0
-    private var pendingRestoreDisplayPower = false
+    // 协程作用域
+    private val cleanupScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-    private val thread: Thread
-    private var interrupted = false
+    // 待恢复的显示电源状态 (使用 StateFlow 替代 AtomicBoolean + wait/notify)
+    private val restoreDisplayPowerFlow = MutableStateFlow<Boolean?>(null)
+
+    private var cleanupJob: Job? = null
 
     init {
-        thread = Thread({ runCleanUp(options) }, "cleanup")
-        thread.start()
+        cleanupJob = cleanupScope.launch {
+            runCleanUp(options)
+        }
     }
 
     /**
-     * 中断清理线程
-     * 注意: 不使用 thread.interrupt() 以避免中断 Command.exec()
+     * 取消清理协程
      */
-    @Synchronized
     fun interrupt() {
-        interrupted = true
-        (this as Object).notify()
+        cleanupJob?.cancel()
     }
 
-    @Throws(InterruptedException::class)
-    fun join() {
-        thread.join()
+    suspend fun join() {
+        cleanupJob?.join()
     }
 
     /**
-     * 启动时的准备工作:
-     * 1. 修改所有需要的设置
-     * 2. 记录原始值用于恢复
-     * 3. 启动监听进程
+     * 阻塞式 join (用于 Java 兼容)
      */
-    @RequiresApi(Build.VERSION_CODES.Q)
-    private fun runCleanUp(options: Options) {
+    fun joinBlocking() {
+        runBlocking {
+            join()
+        }
+    }
+
+    /**
+     * 启动时的准备工作
+     */
+    private suspend fun runCleanUp(options: Options) {
         val restoreState = RestoreState(
             disableShowTouches = prepareShowTouches(options),
             restoreStayOn = prepareStayAwake(options),
@@ -82,19 +73,16 @@ class CleanUp private constructor(options: Options) {
             runMonitorProcess(options, restoreState)
         } catch (e: IOException) {
             Ln.e("Clean up I/O exception", e)
+        } catch (e: CancellationException) {
+            Ln.d("Clean up cancelled")
         }
     }
 
-    /**
-     * 准备 "显示触摸点" 设置
-     * @return 是否需要在清理时禁用
-     */
     private fun prepareShowTouches(options: Options): Boolean {
         if (!options.showTouches) return false
 
         return try {
             val oldValue = Settings.getAndPutValue(Settings.TABLE_SYSTEM, "show_touches", "1")
-            // 只有原来是关闭的，才需要恢复
             oldValue != "1"
         } catch (e: SettingsException) {
             Ln.e("Could not change \"show_touches\"", e)
@@ -102,10 +90,6 @@ class CleanUp private constructor(options: Options) {
         }
     }
 
-    /**
-     * 准备 "保持唤醒" 设置
-     * @return 需要恢复的原值，-1 表示不需要恢复
-     */
     private fun prepareStayAwake(options: Options): Int {
         if (!options.stayAwake) return -1
 
@@ -129,10 +113,6 @@ class CleanUp private constructor(options: Options) {
         }
     }
 
-    /**
-     * 准备 "屏幕超时" 设置
-     * @return 需要恢复的原值，-1 表示不需要恢复
-     */
     private fun prepareScreenTimeout(options: Options): Int {
         val screenOffTimeout = options.screenOffTimeout
         if (screenOffTimeout == -1) return -1
@@ -153,10 +133,6 @@ class CleanUp private constructor(options: Options) {
         }
     }
 
-    /**
-     * 准备 "显示 IME 策略" 设置
-     * @return 需要恢复的原值，-1 表示不需要恢复
-     */
     private fun prepareDisplayImePolicy(options: Options): Int {
         val displayId = options.displayId
         if (displayId <= 0) return -1
@@ -176,20 +152,17 @@ class CleanUp private constructor(options: Options) {
 
     /**
      * 启动独立的监听进程
-     * 该进程会在主进程死亡后执行清理工作
      */
-    @Throws(IOException::class)
-    private fun runMonitorProcess(options: Options, restoreState: RestoreState) {
+    private suspend fun runMonitorProcess(options: Options, restoreState: RestoreState) {
         val cmd = buildCommand(options, restoreState)
-        val process = startCleanupProcess(cmd)
+        val process = withContext(Dispatchers.IO) {
+            startCleanupProcess(cmd)
+        }
         val outputStream = process.outputStream
 
         monitorLoop(outputStream)
     }
 
-    /**
-     * 构建子进程启动命令
-     */
     private fun buildCommand(options: Options, restoreState: RestoreState): Array<String> {
         return arrayOf(
             "app_process",
@@ -204,9 +177,6 @@ class CleanUp private constructor(options: Options) {
         )
     }
 
-    /**
-     * 启动清理进程
-     */
     @Throws(IOException::class)
     private fun startCleanupProcess(cmd: Array<String>): Process {
         val builder = ProcessBuilder(*cmd)
@@ -215,59 +185,34 @@ class CleanUp private constructor(options: Options) {
     }
 
     /**
-     * 主监听循环
-     * 等待动态变更通知并发送给子进程
+     * 主监听循环 (协程版本)
+     * 使用 Flow 监听变更，无需手动 wait/notify
      */
-    @Throws(IOException::class)
-    private fun monitorLoop(outputStream: OutputStream) {
-        while (true) {
-            val changes = waitForChanges() ?: break
-
-            if (changes.hasDisplayPowerChange) {
-                outputStream.write(if (changes.restoreDisplayPower) 1 else 0)
-                outputStream.flush()
-            }
+    private suspend fun monitorLoop(outputStream: OutputStream) {
+        try {
+            // 监听 restoreDisplayPower 的变更
+            restoreDisplayPowerFlow
+                .filterNotNull()
+                .collect { restoreDisplayPower ->
+                    withContext(Dispatchers.IO) {
+                        outputStream.write(if (restoreDisplayPower) 1 else 0)
+                        outputStream.flush()
+                    }
+                    // 重置为 null，等待下一次变更
+                    restoreDisplayPowerFlow.value = null
+                }
+        } catch (e: IOException) {
+            Ln.e("Monitor loop I/O error", e)
         }
-    }
-
-    /**
-     * 等待待处理的变更
-     * @return 变更信息，如果被中断则返回 null
-     */
-    @Synchronized
-    private fun waitForChanges(): PendingChanges? {
-        while (!interrupted && pendingChanges == 0) {
-            try {
-                (this as Object).wait()
-            } catch (e: InterruptedException) {
-                throw AssertionError("Clean up thread MUST NOT be interrupted")
-            }
-        }
-
-        if (interrupted) return null
-
-        val changes = PendingChanges(
-            hasDisplayPowerChange = (pendingChanges and PENDING_CHANGE_DISPLAY_POWER) != 0,
-            restoreDisplayPower = pendingRestoreDisplayPower
-        )
-
-        pendingChanges = 0
-        return changes
     }
 
     /**
      * 动态设置是否恢复显示电源
      */
-    @Synchronized
     fun setRestoreDisplayPower(restoreDisplayPower: Boolean) {
-        pendingRestoreDisplayPower = restoreDisplayPower
-        pendingChanges = pendingChanges or PENDING_CHANGE_DISPLAY_POWER
-        (this as Object).notify()
+        restoreDisplayPowerFlow.value = restoreDisplayPower
     }
 
-    /**
-     * 需要恢复的设置状态
-     */
     private data class RestoreState(
         val disableShowTouches: Boolean,
         val restoreStayOn: Int,
@@ -275,25 +220,11 @@ class CleanUp private constructor(options: Options) {
         val restoreDisplayImePolicy: Int
     )
 
-    /**
-     * 待处理的变更
-     */
-    private data class PendingChanges(
-        val hasDisplayPowerChange: Boolean,
-        val restoreDisplayPower: Boolean
-    )
-
     companion object {
-        // 动态选项标志位
-        private const val PENDING_CHANGE_DISPLAY_POWER = 1 shl 0
-
         fun start(options: Options): CleanUp {
             return CleanUp(options)
         }
 
-        /**
-         * 删除服务端 jar 文件
-         */
         fun unlinkSelf() {
             try {
                 File(Server.SERVER_PATH).delete()
@@ -308,14 +239,12 @@ class CleanUp private constructor(options: Options) {
         }
 
         /**
-         * 子进程入口点
-         * 阻塞等待父进程死亡，然后执行清理工作
+         * 子进程入口点 (保持阻塞式，因为这是独立进程)
          */
         @RequiresApi(Build.VERSION_CODES.Q)
         @JvmStatic
         fun main(args: Array<String>) {
             try {
-                // 创建新会话以避免与服务进程一起被终止
                 Os.setsid()
             } catch (e: ErrnoException) {
                 Ln.e("setsid() failed", e)
@@ -325,15 +254,16 @@ class CleanUp private constructor(options: Options) {
             prepareMainLooper()
 
             val cleanupParams = parseCleanupParams(args)
-            val dynamicState = waitForParentDeath()
 
-            executeCleanup(cleanupParams, dynamicState)
+            // 子进程使用协程运行
+            runBlocking {
+                val dynamicState = waitForParentDeath()
+                executeCleanup(cleanupParams, dynamicState)
+            }
+
             System.exit(0)
         }
 
-        /**
-         * 解析清理参数
-         */
         private fun parseCleanupParams(args: Array<String>): CleanupParams {
             return CleanupParams(
                 displayId = args[0].toInt(),
@@ -346,16 +276,14 @@ class CleanUp private constructor(options: Options) {
         }
 
         /**
-         * 等待父进程死亡
-         * 通过监听 stdin 实现 - 当父进程死亡时管道关闭
+         * 等待父进程死亡 (协程版本)
          */
-        private fun waitForParentDeath(): DynamicState {
+        private suspend fun waitForParentDeath(): DynamicState = withContext(Dispatchers.IO) {
             var restoreDisplayPower = false
 
             try {
                 var msg: Int
                 while (System.`in`.read().also { msg = it } != -1) {
-                    // 动态更新: 是否恢复显示电源
                     check(msg == 0 || msg == 1) { "Invalid message: $msg" }
                     restoreDisplayPower = (msg == 1)
                 }
@@ -363,12 +291,9 @@ class CleanUp private constructor(options: Options) {
                 // 父进程死亡时会触发此异常
             }
 
-            return DynamicState(restoreDisplayPower)
+            DynamicState(restoreDisplayPower)
         }
 
-        /**
-         * 执行清理操作
-         */
         private fun executeCleanup(params: CleanupParams, state: DynamicState) {
             Ln.i("Cleaning up")
 
@@ -440,9 +365,6 @@ class CleanUp private constructor(options: Options) {
             }
         }
 
-        /**
-         * 清理参数 (静态配置)
-         */
         private data class CleanupParams(
             val displayId: Int,
             val restoreStayOn: Int,
@@ -452,9 +374,6 @@ class CleanUp private constructor(options: Options) {
             val restoreDisplayImePolicy: Int
         )
 
-        /**
-         * 动态状态 (运行时更新)
-         */
         private data class DynamicState(
             val restoreDisplayPower: Boolean
         )

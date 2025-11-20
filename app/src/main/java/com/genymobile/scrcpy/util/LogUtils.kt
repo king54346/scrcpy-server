@@ -9,6 +9,7 @@ import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.os.Build
 import android.util.Range
+import androidx.annotation.RequiresApi
 import com.genymobile.scrcpy.AndroidVersions
 import com.genymobile.scrcpy.audio.AudioCodec
 import com.genymobile.scrcpy.device.Device.listApps
@@ -65,7 +66,7 @@ object LogUtils {
         return buildEncoderListMessage("audio", AudioCodec.entries.toTypedArray())
     }
 
-    @TargetApi(AndroidVersions.API_29_ANDROID_10)
+    @RequiresApi(AndroidVersions.API_29_ANDROID_10)
     private fun getHwCodecType(info: MediaCodecInfo): String {
         if (info.isSoftwareOnly) {
             return "sw"
@@ -80,7 +81,7 @@ object LogUtils {
         val builder = StringBuilder("List of displays:")
         val displayManager = displayManager
         val displayIds = displayManager!!.displayIds
-        if (displayIds == null || displayIds.size == 0) {
+        if (displayIds.isEmpty()) {
             builder.append("\n    (none)")
         } else {
             for (id in displayIds) {

@@ -1,169 +1,120 @@
 package com.genymobile.scrcpy.control
 
 /**
- * Decompose accented characters.
+ * 分解带重音符号的字符
  *
+ * 例如，[decompose('é')] 返回 `"\u0301e"`
  *
- * For example, [decompose(&#39;é&#39;)][.decompose] returns `"\u0301e"`.
+ * 这对于注入键盘事件以生成期望的字符非常有用（[android.view.KeyCharacterMap.getEvents]
+ * 使用输入 `"é"` 时返回 `null`，但使用输入 `"\u0301e"` 时正常工作）。
  *
- *
- * This is useful for injecting key events to generate the expected character ([android.view.KeyCharacterMap.getEvents]
- * KeyCharacterMap.getEvents()} returns `null` with input `"é"` but works with input `"\u0301e"`).
- *
- *
- * See [diacritical dead key characters](https://source.android.com/devices/input/key-character-map-files#behaviors).
+ * 参考 [diacritical dead key characters](https://source.android.com/devices/input/key-character-map-files#behaviors)
  */
 object KeyComposition {
-    private const val KEY_DEAD_GRAVE = "\u0300"
-    private const val KEY_DEAD_ACUTE = "\u0301"
-    private const val KEY_DEAD_CIRCUMFLEX = "\u0302"
-    private const val KEY_DEAD_TILDE = "\u0303"
-    private const val KEY_DEAD_UMLAUT = "\u0308"
+    // Unicode 组合字符（死键）
+    private const val KEY_DEAD_GRAVE = "\u0300"      // 重音符 `
+    private const val KEY_DEAD_ACUTE = "\u0301"      // 锐音符 ´
+    private const val KEY_DEAD_CIRCUMFLEX = "\u0302" // 抑扬符 ^
+    private const val KEY_DEAD_TILDE = "\u0303"      // 波浪符 ~
+    private const val KEY_DEAD_UMLAUT = "\u0308"     // 分音符 ¨
 
-    private val COMPOSITION_MAP = createDecompositionMap()
+    // 字符分解映射表，延迟初始化以提高性能
+    private val COMPOSITION_MAP by lazy { createDecompositionMap() }
 
+    /**
+     * 分解带重音符号的字符为组合字符序列
+     *
+     * @param c 要分解的字符
+     * @return 分解后的字符串（组合字符 + 基础字符），如果字符无法分解则返回 null
+     */
     fun decompose(c: Char): String? {
         return COMPOSITION_MAP[c]
     }
 
-    private fun grave(c: Char): String {
-        return KEY_DEAD_GRAVE + c
-    }
+    // region 重音符号构造器
 
-    private fun acute(c: Char): String {
-        return KEY_DEAD_ACUTE + c
-    }
+    /** 构造重音符组合 */
+    private fun grave(c: Char): String = KEY_DEAD_GRAVE + c
 
-    private fun circumflex(c: Char): String {
-        return KEY_DEAD_CIRCUMFLEX + c
-    }
+    /** 构造锐音符组合 */
+    private fun acute(c: Char): String = KEY_DEAD_ACUTE + c
 
-    private fun tilde(c: Char): String {
-        return KEY_DEAD_TILDE + c
-    }
+    /** 构造抑扬符组合 */
+    private fun circumflex(c: Char): String = KEY_DEAD_CIRCUMFLEX + c
 
-    private fun umlaut(c: Char): String {
-        return KEY_DEAD_UMLAUT + c
-    }
+    /** 构造波浪符组合 */
+    private fun tilde(c: Char): String = KEY_DEAD_TILDE + c
 
+    /** 构造分音符组合 */
+    private fun umlaut(c: Char): String = KEY_DEAD_UMLAUT + c
+
+    // endregion
+
+    /**
+     * 创建字符分解映射表
+     *
+     * @return 包含所有支持字符分解规则的不可变映射
+     */
     private fun createDecompositionMap(): Map<Char, String> {
-        val map: MutableMap<Char, String> = HashMap()
-        map['À'] = grave('A')
-        map['È'] = grave('E')
-        map['Ì'] = grave('I')
-        map['Ò'] = grave('O')
-        map['Ù'] = grave('U')
-        map['à'] = grave('a')
-        map['è'] = grave('e')
-        map['ì'] = grave('i')
-        map['ò'] = grave('o')
-        map['ù'] = grave('u')
-        map['Ǹ'] = grave('N')
-        map['ǹ'] = grave('n')
-        map['Ẁ'] = grave('W')
-        map['ẁ'] = grave('w')
-        map['Ỳ'] = grave('Y')
-        map['ỳ'] = grave('y')
+        return mutableMapOf<Char, String>().apply {
+            // 重音符字符
+            putAll(listOf(
+                'À' to grave('A'), 'È' to grave('E'), 'Ì' to grave('I'),
+                'Ò' to grave('O'), 'Ù' to grave('U'), 'à' to grave('a'),
+                'è' to grave('e'), 'ì' to grave('i'), 'ò' to grave('o'),
+                'ù' to grave('u'), 'Ǹ' to grave('N'), 'ǹ' to grave('n'),
+                'Ẁ' to grave('W'), 'ẁ' to grave('w'), 'Ỳ' to grave('Y'),
+                'ỳ' to grave('y')
+            ))
 
-        map['Á'] = acute('A')
-        map['É'] = acute('E')
-        map['Í'] = acute('I')
-        map['Ó'] = acute('O')
-        map['Ú'] = acute('U')
-        map['Ý'] = acute('Y')
-        map['á'] = acute('a')
-        map['é'] = acute('e')
-        map['í'] = acute('i')
-        map['ó'] = acute('o')
-        map['ú'] = acute('u')
-        map['ý'] = acute('y')
-        map['Ć'] = acute('C')
-        map['ć'] = acute('c')
-        map['Ĺ'] = acute('L')
-        map['ĺ'] = acute('l')
-        map['Ń'] = acute('N')
-        map['ń'] = acute('n')
-        map['Ŕ'] = acute('R')
-        map['ŕ'] = acute('r')
-        map['Ś'] = acute('S')
-        map['ś'] = acute('s')
-        map['Ź'] = acute('Z')
-        map['ź'] = acute('z')
-        map['Ǵ'] = acute('G')
-        map['ǵ'] = acute('g')
-        map['Ḉ'] = acute('Ç')
-        map['ḉ'] = acute('ç')
-        map['Ḱ'] = acute('K')
-        map['ḱ'] = acute('k')
-        map['Ḿ'] = acute('M')
-        map['ḿ'] = acute('m')
-        map['Ṕ'] = acute('P')
-        map['ṕ'] = acute('p')
-        map['Ẃ'] = acute('W')
-        map['ẃ'] = acute('w')
+            // 锐音符字符
+            putAll(listOf(
+                'Á' to acute('A'), 'É' to acute('E'), 'Í' to acute('I'),
+                'Ó' to acute('O'), 'Ú' to acute('U'), 'Ý' to acute('Y'),
+                'á' to acute('a'), 'é' to acute('e'), 'í' to acute('i'),
+                'ó' to acute('o'), 'ú' to acute('u'), 'ý' to acute('y'),
+                'Ć' to acute('C'), 'ć' to acute('c'), 'Ĺ' to acute('L'),
+                'ĺ' to acute('l'), 'Ń' to acute('N'), 'ń' to acute('n'),
+                'Ŕ' to acute('R'), 'ŕ' to acute('r'), 'Ś' to acute('S'),
+                'ś' to acute('s'), 'Ź' to acute('Z'), 'ź' to acute('z'),
+                'Ǵ' to acute('G'), 'ǵ' to acute('g'), 'Ḉ' to acute('Ç'),
+                'ḉ' to acute('ç'), 'Ḱ' to acute('K'), 'ḱ' to acute('k'),
+                'Ḿ' to acute('M'), 'ḿ' to acute('m'), 'Ṕ' to acute('P'),
+                'ṕ' to acute('p'), 'Ẃ' to acute('W'), 'ẃ' to acute('w')
+            ))
 
-        map['Â'] = circumflex('A')
-        map['Ê'] = circumflex('E')
-        map['Î'] = circumflex('I')
-        map['Ô'] = circumflex('O')
-        map['Û'] = circumflex('U')
-        map['â'] = circumflex('a')
-        map['ê'] = circumflex('e')
-        map['î'] = circumflex('i')
-        map['ô'] = circumflex('o')
-        map['û'] = circumflex('u')
-        map['Ĉ'] = circumflex('C')
-        map['ĉ'] = circumflex('c')
-        map['Ĝ'] = circumflex('G')
-        map['ĝ'] = circumflex('g')
-        map['Ĥ'] = circumflex('H')
-        map['ĥ'] = circumflex('h')
-        map['Ĵ'] = circumflex('J')
-        map['ĵ'] = circumflex('j')
-        map['Ŝ'] = circumflex('S')
-        map['ŝ'] = circumflex('s')
-        map['Ŵ'] = circumflex('W')
-        map['ŵ'] = circumflex('w')
-        map['Ŷ'] = circumflex('Y')
-        map['ŷ'] = circumflex('y')
-        map['Ẑ'] = circumflex('Z')
-        map['ẑ'] = circumflex('z')
+            // 抑扬符字符
+            putAll(listOf(
+                'Â' to circumflex('A'), 'Ê' to circumflex('E'), 'Î' to circumflex('I'),
+                'Ô' to circumflex('O'), 'Û' to circumflex('U'), 'â' to circumflex('a'),
+                'ê' to circumflex('e'), 'î' to circumflex('i'), 'ô' to circumflex('o'),
+                'û' to circumflex('u'), 'Ĉ' to circumflex('C'), 'ĉ' to circumflex('c'),
+                'Ĝ' to circumflex('G'), 'ĝ' to circumflex('g'), 'Ĥ' to circumflex('H'),
+                'ĥ' to circumflex('h'), 'Ĵ' to circumflex('J'), 'ĵ' to circumflex('j'),
+                'Ŝ' to circumflex('S'), 'ŝ' to circumflex('s'), 'Ŵ' to circumflex('W'),
+                'ŵ' to circumflex('w'), 'Ŷ' to circumflex('Y'), 'ŷ' to circumflex('y'),
+                'Ẑ' to circumflex('Z'), 'ẑ' to circumflex('z')
+            ))
 
-        map['Ã'] = tilde('A')
-        map['Ñ'] = tilde('N')
-        map['Õ'] = tilde('O')
-        map['ã'] = tilde('a')
-        map['ñ'] = tilde('n')
-        map['õ'] = tilde('o')
-        map['Ĩ'] = tilde('I')
-        map['ĩ'] = tilde('i')
-        map['Ũ'] = tilde('U')
-        map['ũ'] = tilde('u')
-        map['Ẽ'] = tilde('E')
-        map['ẽ'] = tilde('e')
-        map['Ỹ'] = tilde('Y')
-        map['ỹ'] = tilde('y')
+            // 波浪符字符
+            putAll(listOf(
+                'Ã' to tilde('A'), 'Ñ' to tilde('N'), 'Õ' to tilde('O'),
+                'ã' to tilde('a'), 'ñ' to tilde('n'), 'õ' to tilde('o'),
+                'Ĩ' to tilde('I'), 'ĩ' to tilde('i'), 'Ũ' to tilde('U'),
+                'ũ' to tilde('u'), 'Ẽ' to tilde('E'), 'ẽ' to tilde('e'),
+                'Ỹ' to tilde('Y'), 'ỹ' to tilde('y')
+            ))
 
-        map['Ä'] = umlaut('A')
-        map['Ë'] = umlaut('E')
-        map['Ï'] = umlaut('I')
-        map['Ö'] = umlaut('O')
-        map['Ü'] = umlaut('U')
-        map['ä'] = umlaut('a')
-        map['ë'] = umlaut('e')
-        map['ï'] = umlaut('i')
-        map['ö'] = umlaut('o')
-        map['ü'] = umlaut('u')
-        map['ÿ'] = umlaut('y')
-        map['Ÿ'] = umlaut('Y')
-        map['Ḧ'] = umlaut('H')
-        map['ḧ'] = umlaut('h')
-        map['Ẅ'] = umlaut('W')
-        map['ẅ'] = umlaut('w')
-        map['Ẍ'] = umlaut('X')
-        map['ẍ'] = umlaut('x')
-        map['ẗ'] = umlaut('t')
-
-        return map
+            // 分音符字符
+            putAll(listOf(
+                'Ä' to umlaut('A'), 'Ë' to umlaut('E'), 'Ï' to umlaut('I'),
+                'Ö' to umlaut('O'), 'Ü' to umlaut('U'), 'ä' to umlaut('a'),
+                'ë' to umlaut('e'), 'ï' to umlaut('i'), 'ö' to umlaut('o'),
+                'ü' to umlaut('u'), 'ÿ' to umlaut('y'), 'Ÿ' to umlaut('Y'),
+                'Ḧ' to umlaut('H'), 'ḧ' to umlaut('h'), 'Ẅ' to umlaut('W'),
+                'ẅ' to umlaut('w'), 'Ẍ' to umlaut('X'), 'ẍ' to umlaut('x'),
+                'ẗ' to umlaut('t')
+            ))
+        }.toMap() // 转换为不可变映射以确保线程安全
     }
 }
