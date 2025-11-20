@@ -20,8 +20,25 @@ import java.io.IOException
 import java.io.OutputStream
 
 /**
- * 清理守护进程 (协程版本)
- */
+ * 清理守护进程
+ *
+ * 负责在主进程被杀死后恢复设备设置。
+ * 通过创建独立进程监听主进程状态，确保即使在 USB 断开等极端情况下也能正确清理。
+ *主进程 (scrcpy server)           子进程 (cleanup monitor)
+ *     |                                     |
+ *     | 启动时修改设置                        |
+ *     | 创建子进程 ----------------->        |
+ *     | 保持管道连接                          | 监听管道
+ *     |                                    |
+ *     | 被杀死 ✗                            |
+ *     | 管道关闭 ------------------>        | 检测到管道关闭
+ *                                         | 恢复所有设置 ✓
+ * 工作原理:
+ * 1. 主进程启动时修改设备设置(如显示触摸点、保持唤醒等)并记录原值
+ * 2. 创建独立的子进程监听主进程的 stdout 管道
+ * 3. 主进程死亡时管道关闭，子进程检测到后恢复所有设置
+*/
+
 @RequiresApi(Build.VERSION_CODES.Q)
 class CleanUp private constructor(options: Options) {
     // 协程作用域
@@ -47,15 +64,6 @@ class CleanUp private constructor(options: Options) {
 
     suspend fun join() {
         cleanupJob?.join()
-    }
-
-    /**
-     * 阻塞式 join (用于 Java 兼容)
-     */
-    fun joinBlocking() {
-        runBlocking {
-            join()
-        }
     }
 
     /**

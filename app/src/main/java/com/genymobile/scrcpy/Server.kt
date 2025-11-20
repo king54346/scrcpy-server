@@ -11,10 +11,7 @@ import com.genymobile.scrcpy.opengl.OpenGLRunner
 import com.genymobile.scrcpy.util.Ln
 import com.genymobile.scrcpy.util.LogUtils
 import com.genymobile.scrcpy.video.*
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.*
 import java.io.File
 import java.io.IOException
 import kotlin.system.exitProcess
@@ -25,31 +22,26 @@ import kotlin.system.exitProcess
  */
 object Server {
     val SERVER_PATH: String = getServerPath()
+
     private fun getServerPath(): String {
-        val classPaths = System.getProperty("java.class.path")
+        return System.getProperty("java.class.path")
             ?.split(File.pathSeparator)
             ?.firstOrNull()
-        return classPaths ?: throw IllegalStateException("Cannot determine server path")
+            ?: throw IllegalStateException("Cannot determine server path")
     }
 
     @RequiresApi(Build.VERSION_CODES.Q)
     @JvmStatic
     fun main(args: Array<String>) {
-        var status = 0
-        val job = CoroutineScope(Dispatchers.Default).launch {
+        val status = runBlocking {
             try {
                 internalMain(args)
+                0
             } catch (t: Throwable) {
                 Ln.e("Fatal error: ${t.message}", t)
-                status = 1
+                1
             }
         }
-
-        // 阻塞等待作业完成
-        runBlocking {
-            job.join()
-        }
-
         exitProcess(status)
     }
 
@@ -74,17 +66,15 @@ object Server {
             scrcpy(options)
         } catch (e: ConfigurationException) {
             // 用户友好的错误已记录，不打印堆栈
+            Ln.e("Configuration error: ${e.message}")
         }
     }
 
-    //    1. 创建连接和处理器
-    //    2.  启动所有异步任务
-    //    3. Looper.loop() 等待完成
     @RequiresApi(Build.VERSION_CODES.Q)
     @Throws(IOException::class, ConfigurationException::class)
     private suspend fun scrcpy(options: Options) {
         validateOptions(options)
-        // cleanup monitor 进程
+
         val cleanUp = if (options.cleanup) CleanUp.start(options) else null
         Workarounds.apply()
 
@@ -98,7 +88,6 @@ object Server {
         )
 
         try {
-            //  启动所有异步任务
             runMirroringSession(connection, options, cleanUp)
         } finally {
             cleanupResources(connection, cleanUp)
@@ -123,30 +112,38 @@ object Server {
         }
     }
 
-    private fun runMirroringSession(
+    /**
+     * 运行镜像会话
+     * 协调所有异步处理器的生命周期
+     */
+    private suspend fun runMirroringSession(
         connection: DesktopConnection,
         options: Options,
         cleanUp: CleanUp?
-    ) {
-        //  发送设备元数据
+    ) = coroutineScope {
+        // 发送设备元数据
         if (options.sendDeviceMeta) {
             connection.sendDeviceMeta(Device.deviceName)
         }
-        //   创建处理器列表
+
+        // 创建处理器列表
         val asyncProcessors = mutableListOf<AsyncProcessor>()
-        //  设置控制器：监听客户端的触摸、键盘、鼠标输入 将输入转换为 Android 事件注入设备
+
+        // 设置控制器
         val controller = setupController(connection, options, cleanUp, asyncProcessors)
-        //  设置音频管道
+
+        // 设置音频管道
         if (options.audio) {
             setupAudioPipeline(connection, options, asyncProcessors)
         }
+
         // 设置视频管道
         if (options.video) {
             setupVideoPipeline(connection, options, controller, asyncProcessors)
         }
-        //  启动所有处理器
-        startAsyncProcessors(asyncProcessors)
-        Looper.loop() // 主线程等待，直到被 Completion 中断
+
+        // 启动所有处理器并等待完成
+        startAndAwaitProcessors(asyncProcessors)
     }
 
     private fun setupController(
@@ -170,23 +167,21 @@ object Server {
         options: Options,
         asyncProcessors: MutableList<AsyncProcessor>
     ) {
-        //  创建音频采集器
+        // 创建音频采集器
         val audioCapture = if (options.audioSource.isDirect) {
-            //            如果是直接音频源 → 使用 AudioDirectCapture
             AudioDirectCapture(options.audioSource)
         } else {
-            //  否则 → 使用 AudioPlaybackCapture（音频重定向/复制）
             AudioPlaybackCapture(options.audioDup)
         }
-            //  创建音频流传输器 (audioStreamer
+
+        // 创建音频流传输器
         val audioStreamer = connection.audioFd?.let {
             Streamer(it, options.audioCodec, options.sendCodecMeta, options.sendFrameMeta)
         } ?: throw IllegalStateException("Audio enabled but no audio stream")
-            //    创建音频录制/编码器 (audioRecorder
+
+        // 创建音频录制/编码器
         val audioRecorder = when (options.audioCodec) {
-            //  如果编码格式是 RAW（原始音频）→  AudioRawRecorder 直接录制
             AudioCodec.RAW -> AudioRawRecorder(audioCapture, audioStreamer)
-            //  其他格式（如 AAC、Opus）→ 使用 AudioEncoder 进行编码
             else -> AudioEncoder(audioCapture, audioStreamer, options)
         }
 
@@ -202,9 +197,11 @@ object Server {
         val videoStreamer = connection.videoFd?.let {
             Streamer(it, options.videoCodec, options.sendCodecMeta, options.sendFrameMeta)
         } ?: throw IllegalStateException("Video enabled but no video stream")
+
         // 创建屏幕捕获对象
         val surfaceCapture = createSurfaceCapture(options, controller)
-        //创建 Surface 编码器
+
+        // 创建 Surface 编码器
         val surfaceEncoder = SurfaceEncoder(surfaceCapture, videoStreamer, options)
 
         asyncProcessors.add(surfaceEncoder)
@@ -215,32 +212,55 @@ object Server {
         options: Options,
         controller: Controller?
     ): SurfaceCapture {
-        // 2 种视频源： 显示器源和摄像头源
         return when (options.videoSource) {
-            // 分2中情况: 创建新显示器  捕获现有显示器
             VideoSource.DISPLAY -> {
                 options.newDisplay?.let {
-                    //  创建一个新的虚拟显示器并捕获
+                    // 创建新的虚拟显示器并捕获
                     NewDisplayCapture(controller, options)
                 } ?: run {
                     check(options.displayId != Device.DISPLAY_ID_NONE) {
                         "Display ID must be specified"
                     }
-                    // 捕获现有显示器, 通过 options中的displayId
+                    // 捕获现有显示器
                     ScreenCapture(controller, options)
                 }
             }
-            //   对于非显示器的视频源(比如摄像头) 使用 CameraCapture 进行捕获
+            // 摄像头捕获
             else -> CameraCapture(options)
         }
     }
 
-    private fun startAsyncProcessors(asyncProcessors: List<AsyncProcessor>) {
-        val completion = Completion(asyncProcessors.size)
+    /**
+     * 启动所有异步处理器并等待它们完成
+     * 使用协程替代 Looper.loop() 阻塞主线程
+     */
+    private suspend fun startAndAwaitProcessors(asyncProcessors: List<AsyncProcessor>) = coroutineScope {
+        val completionDeferred = CompletableDeferred<Boolean>()
+        val completion = ProcessorCompletion(asyncProcessors.size, completionDeferred)
+
+        // 启动所有处理器
         asyncProcessors.forEach { processor ->
             processor.start { fatalError ->
                 completion.addCompleted(fatalError)
             }
+        }
+
+        // 并行运行 Looper 和等待完成
+        val looperJob = launch(Dispatchers.Main) {
+            Looper.loop()
+        }
+
+        try {
+            // 等待所有处理器完成
+            val hadFatalError = completionDeferred.await()
+
+            if (hadFatalError) {
+                Ln.e("Fatal error occurred in one or more processors")
+            }
+        } finally {
+            // 确保 Looper 被停止
+            Looper.getMainLooper().quitSafely()
+            looperJob.cancel()
         }
     }
 
@@ -248,20 +268,27 @@ object Server {
     private suspend fun cleanupResources(
         connection: DesktopConnection,
         cleanUp: CleanUp?
-    ) {
-        cleanUp?.interrupt()
-        // todo  停止所有的  asyncProcessors
-        OpenGLRunner.quit()
-        connection.shutdown()
+    ) = coroutineScope {
+        // 并行清理所有资源
+        val jobs = listOfNotNull(
+            cleanUp?.let {
+                launch {
+                    it.interrupt()
+                    it.join()
+                }
+            },
+            launch {
+                OpenGLRunner.quit()
+                OpenGLRunner.join()
+            },
+            launch {
+                connection.shutdown()
+                connection.close()
+            }
+        )
 
-        try {
-            cleanUp?.join()
-            OpenGLRunner.join()
-        } catch (e: InterruptedException) {
-            Thread.currentThread().interrupt()
-        }
-
-        connection.close()
+        // 等待所有清理完成
+        jobs.forEach { it.join() }
     }
 
     private fun setupUncaughtExceptionHandler() {
@@ -323,10 +350,13 @@ object Server {
     }
 
     /**
-     * 跟踪异步处理器完成状态
-     * 当所有处理器完成或发生致命错误时退出主循环
+     * 跟踪异步处理器完成状态（协程版本）
+     * 使用 CompletableDeferred 替代 synchronized + Looper.quit
      */
-    private class Completion(private var running: Int) {
+    private class ProcessorCompletion(
+        private var running: Int,
+        private val completionDeferred: CompletableDeferred<Boolean>
+    ) {
         private var fatalError = false
 
         @Synchronized
@@ -336,9 +366,9 @@ object Server {
                 this.fatalError = true
             }
 
-            // 全部完成或遇到致命错误时退出
+            // 全部完成或遇到致命错误时通知
             if (running == 0 || this.fatalError) {
-                Looper.getMainLooper().quitSafely()
+                completionDeferred.complete(this.fatalError)
             }
         }
     }
