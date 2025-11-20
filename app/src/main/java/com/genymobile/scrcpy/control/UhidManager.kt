@@ -28,13 +28,9 @@ class UhidManager(private val sender: DeviceMessageSender, private val displayUn
     private var queue: MessageQueue? = null
 
     init {
-        if (Build.VERSION.SDK_INT >= AndroidVersions.API_23_ANDROID_6_0) {
-            val thread = HandlerThread("UHidManager")
-            thread.start()
-            queue = thread.looper.queue
-        } else {
-            queue = null
-        }
+        val thread = HandlerThread("UHidManager")
+        thread.start()
+        queue = thread.looper.queue
     }
 
     @Throws(IOException::class)
@@ -69,40 +65,36 @@ class UhidManager(private val sender: DeviceMessageSender, private val displayUn
     }
 
     private fun registerUhidListener(id: Int, fd: FileDescriptor) {
-        if (Build.VERSION.SDK_INT >= AndroidVersions.API_23_ANDROID_6_0) {
-            queue!!.addOnFileDescriptorEventListener(
-                fd, OnFileDescriptorEventListener.EVENT_INPUT
-            ) { fd2: FileDescriptor?, events: Int ->
-                try {
-                    buffer.clear()
-                    val r = Os.read(fd2, buffer)
-                    buffer.flip()
-                    if (r > 0) {
-                        val type = buffer.getInt()
-                        if (type == UHID_OUTPUT) {
-                            val data = extractHidOutputData(buffer)
-                            if (data != null) {
-                                val msg = DeviceMessage.createUhidOutput(id, data)
-                                sender.send(msg)
-                            }
+        queue!!.addOnFileDescriptorEventListener(
+            fd, OnFileDescriptorEventListener.EVENT_INPUT
+        ) { fd2: FileDescriptor?, events: Int ->
+            try {
+                buffer.clear()
+                val r = Os.read(fd2, buffer)
+                buffer.flip()
+                if (r > 0) {
+                    val type = buffer.getInt()
+                    if (type == UHID_OUTPUT) {
+                        val data = extractHidOutputData(buffer)
+                        if (data != null) {
+                            val msg = DeviceMessage.createUhidOutput(id, data)
+                            sender.send(msg)
                         }
                     }
-                } catch (e: ErrnoException) {
-                    e("Failed to read UHID output", e)
-                    return@addOnFileDescriptorEventListener 0
-                } catch (e: InterruptedIOException) {
-                    e("Failed to read UHID output", e)
-                    return@addOnFileDescriptorEventListener 0
                 }
-                events
+            } catch (e: ErrnoException) {
+                e("Failed to read UHID output", e)
+                return@addOnFileDescriptorEventListener 0
+            } catch (e: InterruptedIOException) {
+                e("Failed to read UHID output", e)
+                return@addOnFileDescriptorEventListener 0
             }
+            events
         }
     }
 
     private fun unregisterUhidListener(fd: FileDescriptor) {
-        if (Build.VERSION.SDK_INT >= AndroidVersions.API_23_ANDROID_6_0) {
-            queue!!.removeOnFileDescriptorEventListener(fd)
-        }
+        queue!!.removeOnFileDescriptorEventListener(fd)
     }
 
     @Throws(IOException::class)

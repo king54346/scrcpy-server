@@ -32,7 +32,7 @@ class PositionMapper(val videoSize: Size, private val videoToDeviceMatrix: Affin
             filterTransform: AffineMatrix?,
             targetSize: Size?
         ): PositionMapper {
-            val convertToPixels = !videoSize.equals(targetSize) || filterTransform != null
+            val convertToPixels = videoSize != targetSize || filterTransform != null
             var transform = filterTransform
             if (convertToPixels) {
                 val inputTransform = AffineMatrix.ndcFromPixels(videoSize)

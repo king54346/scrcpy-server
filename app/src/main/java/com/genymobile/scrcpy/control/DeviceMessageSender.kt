@@ -30,7 +30,7 @@ class DeviceMessageSender(private val controlChannel: ControlChannel) {
                 loop()
             } catch (e: IOException) {
                 // this is expected on close
-            } catch (e: InterruptedException) {
+            } catch (_: InterruptedException) {
             } finally {
                 d("Device message sender stopped")
             }

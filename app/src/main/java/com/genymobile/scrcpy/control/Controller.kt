@@ -749,12 +749,7 @@ class Controller(
 
     private suspend fun waitDisplayData(timeoutMillis: Long): DisplayData? {
         return withTimeoutOrNull(timeoutMillis) {
-            var data = displayData.get()
-            if (data != null) {
-                data
-            } else {
-                displayDataChannel.receive()
-            }
+            displayData.get() ?: displayDataChannel.receive()
         }
     }
 

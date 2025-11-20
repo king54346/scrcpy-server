@@ -72,54 +72,15 @@ handleClipboardChange()
                   ↓
               客户端显示
 
+app_process：
+1. app_process可以在android上启动一个独立java进程
+2. 使用adb shell 启动java进程，此时java进程拥有shell级别的权限(远程控制和远程录屏)
+3. 利用app启动java进程，此时java进程和app权限相同
+4. 编译 Java 代码 dx --dex --output=MyApp.dex MyApp.class
+5. 将文件推送到设备 adb push MyApp.dex /data/local/tmp/
+6. shell 执行 app_process: adb shell app_process <path_to_executable> <class_name> [options] <path_to_executable> 是 Android 设备上运行应用程序的路径，通常是 /system/bin <class_name> 是你想执行的 Java 类
+7. app_process 反射调用场景： 调用 @hide 的API（编译时不可见）,直接访问系统服务的 Binder 接口
 
-
-androidx.room - SQLite 数据库抽象层
-类型安全的数据库访问
-
-androidx.media - 媒体播放
-Media2, MediaRouter
-
-
-androidx.work - 后台任务调度
-WorkManager - 可延迟的后台任务
-
-androidx.core - 核心工具类和扩展函数
-ContextCompat, ViewCompat 等兼容性辅助类
-Kotlin 扩展函数
-
-
-androidx.core.graphics
-图形和绘制相关：
-
-ColorUtils - 颜色工具类（颜色转换、计算对比度等）
-BitmapCompat - Bitmap 兼容
-PathSegment - 路径片段
-Insets - 边距
-BlendModeCompat - 混合模式兼容
-drawable 子包 - Drawable 相关工具
-
-androidx.core.os
-系统功能相关：
-
-BuildCompat - 系统版本检查
-BundleCompat - Bundle 兼容
-HandlerCompat - Handler 兼容
-LocaleListCompat - 语言列表兼容
-TraceCompat - 性能追踪
-CancellationSignal - 取消信号
-UserManagerCompat - 用户管理
-
-
-androidx.core.net
-网络相关：
-UriCompat - Uri 兼容
-ConnectivityManagerCompat - 网络连接管理
-MailTo - 邮件链接解析
-
-app_process 反射调用场景：
-    调用 @hide 的API（编译时不可见）
-    直接访问系统服务的 Binder 接口
 
 
 音频同步： 1. rarRecorder 原始音频 2. audioEncoder 编码音频
@@ -206,14 +167,83 @@ createDisplay 需要手动指定从哪个物理显示镜像内容
 
 
 
+通信实现:  
+LocalSocket通过fd将对应的数据写入 ，通过端口转发的功能，能将localsocket转发到pc端，pc端通过转发的这个端口进行收发数据 adb forward tcp:27183 localabstract:scrcpy，(client上创建一个tcp连接到localhost:27183,通过forword转发到scrcpy socket上）
+
+adb forward 创建一个转发规则：
+电脑上的某个端口 ↔ 设备上的某个端口或服务
+能把android上的服务端口映射到电脑上的端口，通过电脑可以直接访问android应用上的服务
 
 
+controller：
+接收线程监听client的controlmessage，调用inputManager中的injectinputevent注入事件
+输入： 反射调用injectInputEvent向系统注入输入事件（如触摸、按键等）
+https://android.googlesource.com/platform/frameworks/base/+/master/core/java/android/hardware/input/InputManager.java
+```java
+  injectInputEventMethod = manager.getClass().getMethod("injectInputEvent", InputEvent.class, int.class);
+  // event KeyEvent，MotionEvent(多点触控，触控压力，滑动)   mode： 0异步处理，1 等待事件处理，2 处理结果完成例如
+  method.invoke(manager, event, mode);
 
+  // 字符串输入
+  // 字符串转换为字符数组并获取对应的键事件
+  KeyEvent[] events = charMap.getEvents(chars);
+  //循环注入每个键事件
+  for (KeyEvent event : events) {
+    if (!device.injectEvent(event, Device.INJECT_MODE_ASYNC)) {
+        return false;
+    }
+  }
+```
 
 
 -------------------------------------------------------------------------
 System.loadLibrary("myapplication") 是在加载 C++ 编译出来的动态库（.so 文件）。
 cmake中  project("myapplication")
 GameActivity中super.onCreate() 启动 Native 线程 通过 android_app->msgwrite， android_app->msgread
+
+
+
+androidx.room - SQLite 数据库抽象层
+类型安全的数据库访问
+
+androidx.media - 媒体播放
+Media2, MediaRouter
+
+
+androidx.work - 后台任务调度
+WorkManager - 可延迟的后台任务
+
+androidx.core - 核心工具类和扩展函数
+ContextCompat, ViewCompat 等兼容性辅助类
+Kotlin 扩展函数
+
+
+androidx.core.graphics
+图形和绘制相关：
+
+ColorUtils - 颜色工具类（颜色转换、计算对比度等）
+BitmapCompat - Bitmap 兼容
+PathSegment - 路径片段
+Insets - 边距
+BlendModeCompat - 混合模式兼容
+drawable 子包 - Drawable 相关工具
+
+androidx.core.os
+系统功能相关：
+
+BuildCompat - 系统版本检查
+BundleCompat - Bundle 兼容
+HandlerCompat - Handler 兼容
+LocaleListCompat - 语言列表兼容
+TraceCompat - 性能追踪
+CancellationSignal - 取消信号
+UserManagerCompat - 用户管理
+
+
+androidx.core.net
+网络相关：
+UriCompat - Uri 兼容
+ConnectivityManagerCompat - 网络连接管理
+MailTo - 邮件链接解析
 
 

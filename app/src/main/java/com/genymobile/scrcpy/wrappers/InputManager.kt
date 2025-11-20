@@ -1,10 +1,10 @@
 package com.genymobile.scrcpy.wrappers
 
 import android.annotation.SuppressLint
-import android.annotation.TargetApi
 import android.hardware.input.InputManager as AndroidInputManager
 import android.view.InputEvent
 import android.view.MotionEvent
+import androidx.annotation.RequiresApi
 import com.genymobile.scrcpy.AndroidVersions
 import com.genymobile.scrcpy.FakeContext
 import com.genymobile.scrcpy.util.Ln
@@ -43,7 +43,7 @@ class InputManager private constructor(private val manager: AndroidInputManager)
         }
     }
 
-    @TargetApi(AndroidVersions.API_35_ANDROID_15)
+    @RequiresApi(AndroidVersions.API_35_ANDROID_15)
     fun addUniqueIdAssociationByPort(inputPort: String, uniqueId: String) {
         try {
             val method = getAddUniqueIdAssociationByPortMethod()
@@ -53,7 +53,7 @@ class InputManager private constructor(private val manager: AndroidInputManager)
         }
     }
 
-    @TargetApi(AndroidVersions.API_35_ANDROID_15)
+    @RequiresApi(AndroidVersions.API_35_ANDROID_15)
     fun removeUniqueIdAssociationByPort(inputPort: String) {
         try {
             val method = getRemoveUniqueIdAssociationByPortMethod()
