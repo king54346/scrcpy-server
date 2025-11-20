@@ -1,7 +1,6 @@
 package com.genymobile.scrcpy.audio
 
 import android.annotation.SuppressLint
-import android.annotation.TargetApi
 import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFormat
@@ -156,7 +155,6 @@ class AudioPlaybackCapture(private val keepPlayingOnDevice: Boolean) : AudioCapt
         }
     }
 
-    @TargetApi(AndroidVersions.API_24_ANDROID_7_0)
     override fun read(outDirectBuffer: ByteBuffer, outBufferInfo: MediaCodec.BufferInfo): Int {
         return reader?.read(outDirectBuffer, outBufferInfo) ?: 0
     }

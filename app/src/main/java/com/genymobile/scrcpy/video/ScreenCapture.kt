@@ -19,184 +19,106 @@ import com.genymobile.scrcpy.util.AffineMatrix
 import com.genymobile.scrcpy.util.Ln
 import com.genymobile.scrcpy.util.LogUtils
 import com.genymobile.scrcpy.wrappers.ServiceManager.displayManager
-import com.genymobile.scrcpy.wrappers.SurfaceControl.closeTransaction
-import com.genymobile.scrcpy.wrappers.SurfaceControl.createDisplay
-import com.genymobile.scrcpy.wrappers.SurfaceControl.destroyDisplay
-import com.genymobile.scrcpy.wrappers.SurfaceControl.openTransaction
-import com.genymobile.scrcpy.wrappers.SurfaceControl.setDisplayLayerStack
-import com.genymobile.scrcpy.wrappers.SurfaceControl.setDisplayProjection
-import com.genymobile.scrcpy.wrappers.SurfaceControl.setDisplaySurface
+import com.genymobile.scrcpy.wrappers.SurfaceControl
 import java.io.IOException
 
-class ScreenCapture(vdListener: VirtualDisplayListener?, options: Options) :
-    SurfaceCapture() {
-    private val vdListener: VirtualDisplayListener? = vdListener
-    private val displayId = options.displayId
-    private var maxSize: Int
-    private val crop: Rect?
-    private var captureOrientationLock: Orientation.Lock
-    private var captureOrientation: Orientation
-    private val angle: Float
+/**
+ * 屏幕捕获实现类
+ * 负责创建虚拟显示器并将屏幕内容渲染到指定 Surface
+ */
+class ScreenCapture(
+    private val vdListener: VirtualDisplayListener?,
+    options: Options
+) : SurfaceCapture() {
 
+    // 配置参数
+    private val displayId = options.displayId
+    private var maxSize: Int = options.maxSize
+    private val crop: Rect? = options.crop
+    private var captureOrientationLock: Orientation.Lock = options.captureOrientationLock
+    private var captureOrientation: Orientation = options.captureOrientation
+    private val angle: Float = options.angle
+
+    // 显示器信息
     private var displayInfo: DisplayInfo? = null
     override var size: Size? = null
         private set
 
-    private val displaySizeMonitor: DisplaySizeMonitor = DisplaySizeMonitor()
-
-    private var display: IBinder? = null
-    private var virtualDisplay: VirtualDisplay? = null
-
+    // 监听器和渲染组件
+    private val displaySizeMonitor = DisplaySizeMonitor()
     private var transform: AffineMatrix? = null
     private var glRunner: OpenGLRunner? = null
 
+    // 虚拟显示器资源
+    private var display: IBinder? = null
+    private var virtualDisplay: VirtualDisplay? = null
+
     init {
-        assert(displayId != Device.DISPLAY_ID_NONE)
-        this.maxSize = options.maxSize
-        this.crop = options.crop
-        this.captureOrientationLock = options.captureOrientationLock
-        this.captureOrientation = options.captureOrientation
-        checkNotNull(captureOrientationLock)
-        checkNotNull(captureOrientation)
-        this.angle = options.angle
+        require(displayId != Device.DISPLAY_ID_NONE) {
+            "Display ID cannot be DISPLAY_ID_NONE"
+        }
     }
 
-    public override fun init() {
-        displaySizeMonitor.start(displayId) { this.invalidate() }
+    override fun init() {
+        displaySizeMonitor.start(displayId) { invalidate() }
     }
 
     @Throws(ConfigurationException::class)
     override fun prepare() {
-        displayInfo = displayManager!!.getDisplayInfo(displayId)
-        if (displayInfo == null) {
-            Ln.e(
-                """Display $displayId not found
-${LogUtils.buildDisplayListMessage()}"""
-            )
-            throw ConfigurationException("Unknown display id: $displayId")
-        }
+        // 获取并验证显示器信息
+        displayInfo = displayManager?.getDisplayInfo(displayId)
+            ?: throw ConfigurationException(buildDisplayErrorMessage())
 
-        if ((displayInfo!!.flags and DisplayInfo.FLAG_SUPPORTS_PROTECTED_BUFFERS) == 0) {
-            Ln.w("Display doesn't have FLAG_SUPPORTS_PROTECTED_BUFFERS flag, mirroring can be restricted")
-        }
+        checkProtectedBuffersSupport()
 
         val displaySize = displayInfo!!.size
-        displaySizeMonitor.sessionDisplaySize=displaySize
+        displaySizeMonitor.sessionDisplaySize = displaySize
 
+        // 锁定初始方向
         if (captureOrientationLock == Orientation.Lock.LockedInitial) {
-            // The user requested to lock the video orientation to the current orientation
             captureOrientationLock = Orientation.Lock.LockedValue
             captureOrientation = Orientation.fromRotation(displayInfo!!.rotation)
         }
 
-        val filter: VideoFilter = VideoFilter(displaySize)
-
-        if (crop != null) {
-            val transposed = (displayInfo!!.rotation % 2) != 0
-            filter.addCrop(crop, transposed)
-        }
-
-        val locked = captureOrientationLock != Orientation.Lock.Unlocked
-        filter.addOrientation(displayInfo!!.rotation, locked, captureOrientation)
-        filter.addAngle(angle.toDouble())
-
-        transform = filter.inverseTransform
-        size = filter.outputSize?.limit(maxSize)?.round8()
+        // 构建视频滤镜链
+        val (finalTransform, outputSize) = buildVideoFilter(displaySize)
+        transform = finalTransform
+        size = outputSize
     }
 
     @Throws(IOException::class)
     override fun start(surface: Surface?) {
-        var surface = surface
-        if (display != null) {
-            destroyDisplay(display)
-            display = null
-        }
-        if (virtualDisplay != null) {
-            virtualDisplay!!.release()
-            virtualDisplay = null
-        }
+        // 清理旧资源
+        cleanupDisplayResources()
 
-        val inputSize: Size?
+        val inputSize: Size
+        val outputSurface: Surface?
+
         if (transform != null) {
-            // If there is a filter, it must receive the full display content
+            // 需要 OpenGL 滤镜处理
             inputSize = displayInfo!!.size
-            assert(glRunner == null)
-            val glFilter = AffineOpenGLFilter(transform!!)
-            glRunner = OpenGLRunner(glFilter)
-            surface = size?.let { surface?.let { it1 -> glRunner!!.start(inputSize, it, it1) } }
+            outputSurface = startOpenGLPipeline(surface, inputSize)
         } else {
-            // If there is no filter, the display must be rendered at target video size directly
-            inputSize = size
+            // 直接渲染,无需滤镜
+            inputSize = size ?: throw IllegalStateException("Size not initialized")
+            outputSurface = surface
         }
 
-        try {
-            virtualDisplay = displayManager
-                ?.createVirtualDisplay(
-                    "scrcpy",
-                    inputSize!!.width,
-                    inputSize.height,
-                    displayId,
-                    surface
-                )
-            Ln.d("Display: using DisplayManager API")
-        } catch (displayManagerException: Exception) {
-            try {
-                display = createDisplay()
+        // 尝试创建虚拟显示器
+        createVirtualDisplayWithFallback(inputSize, outputSurface)
 
-                val deviceSize = displayInfo!!.size
-                val layerStack = displayInfo!!.layerStack
-                setDisplaySurface(
-                    display!!,
-                    surface,
-                    deviceSize.toRect(),
-                    inputSize!!.toRect(),
-                    layerStack
-                )
-                Ln.d("Display: using SurfaceControl API")
-            } catch (surfaceControlException: Exception) {
-                Ln.e("Could not create display using DisplayManager", displayManagerException)
-                Ln.e("Could not create display using SurfaceControl", surfaceControlException)
-                throw AssertionError("Could not create display")
-            }
-        }
-
-        vdListener?.let { listener ->
-            val currentVirtualDisplay = virtualDisplay
-
-            val (virtualDisplayId, positionMapper) = if (currentVirtualDisplay == null || displayId == 0) {
-                // Surface control or main display
-                val deviceSize = displayInfo!!.size
-                Pair(displayId, size?.let { PositionMapper.create(it, transform, deviceSize) })
-            } else {
-                // Virtual display
-                Pair(
-                    currentVirtualDisplay.display.displayId,
-                    size?.let { PositionMapper.create(it, transform, inputSize) }
-                )
-            }
-
-            listener.onNewVirtualDisplay(virtualDisplayId, positionMapper)
-        }
+        // 通知监听器
+        notifyVirtualDisplayCreated(inputSize)
     }
 
     override fun stop() {
-        if (glRunner != null) {
-            glRunner!!.stopAndRelease()
-            glRunner = null
-        }
+        glRunner?.stopAndRelease()
+        glRunner = null
     }
 
     override fun release() {
         displaySizeMonitor.stopAndRelease()
-
-        if (display != null) {
-            destroyDisplay(display)
-            display = null
-        }
-        if (virtualDisplay != null) {
-            virtualDisplay!!.release()
-            virtualDisplay = null
-        }
+        cleanupDisplayResources()
     }
 
     override fun setMaxSize(newMaxSize: Int): Boolean {
@@ -208,31 +130,188 @@ ${LogUtils.buildDisplayListMessage()}"""
         invalidate()
     }
 
-    companion object {
-        @Throws(Exception::class)
-        private fun createDisplay(): IBinder {
-            // Since Android 12 (preview), secure displays could not be created with shell permissions anymore.
-            // On Android 12 preview, SDK_INT is still R (not S), but CODENAME is "S".
-            val secure =
-                Build.VERSION.SDK_INT < AndroidVersions.API_30_ANDROID_11 || (Build.VERSION.SDK_INT == AndroidVersions.API_30_ANDROID_11
-                        && "S" != Build.VERSION.CODENAME)
-            return createDisplay("scrcpy", secure)
+    // ==================== 私有辅助方法 ====================
+
+    /**
+     * 清理显示器相关资源
+     */
+    private fun cleanupDisplayResources() {
+        display?.let {
+            SurfaceControl.destroyDisplay(it)
+            display = null
+        }
+        virtualDisplay?.release()
+        virtualDisplay = null
+    }
+
+    /**
+     * 检查保护缓冲区支持
+     */
+    private fun checkProtectedBuffersSupport() {
+        val hasProtectedBuffers = displayInfo?.flags?.let {
+            (it and DisplayInfo.FLAG_SUPPORTS_PROTECTED_BUFFERS) != 0
+        } ?: false
+
+        if (!hasProtectedBuffers) {
+            Ln.w("Display doesn't support protected buffers, DRM content mirroring may be restricted")
+        }
+    }
+
+    /**
+     * 构建显示器错误信息
+     */
+    private fun buildDisplayErrorMessage(): String {
+        return "Display $displayId not found\n${LogUtils.buildDisplayListMessage()}"
+            .also { Ln.e(it) }
+    }
+
+    /**
+     * 构建视频滤镜链并返回变换矩阵和输出尺寸
+     */
+    private fun buildVideoFilter(displaySize: Size): Pair<AffineMatrix?, Size?> {
+        val filter = VideoFilter(displaySize)
+
+        // 应用裁剪
+        crop?.let {
+            val transposed = (displayInfo!!.rotation % 2) != 0
+            filter.addCrop(it, transposed)
         }
 
-        private fun setDisplaySurface(
+        // 应用方向锁定
+        val locked = captureOrientationLock != Orientation.Lock.Unlocked
+        filter.addOrientation(displayInfo!!.rotation, locked, captureOrientation)
+
+        // 应用旋转角度
+        filter.addAngle(angle.toDouble())
+
+        // 计算最终变换和输出尺寸
+        val outputSize = filter.outputSize?.limit(maxSize)?.round8()
+        return Pair(filter.inverseTransform, outputSize)
+    }
+
+    /**
+     * 启动 OpenGL 处理管道
+     */
+    private fun startOpenGLPipeline(surface: Surface?, inputSize: Size): Surface? {
+        require(glRunner == null) { "OpenGL runner already exists" }
+
+        val glFilter = AffineOpenGLFilter(transform!!)
+        glRunner = OpenGLRunner(glFilter)
+
+        return size?.let { outputSize ->
+            surface?.let { glRunner!!.start(inputSize, outputSize, it) }
+        }
+    }
+
+    /**
+     * 创建虚拟显示器,失败时使用 SurfaceControl 备用方案
+     */
+    private fun createVirtualDisplayWithFallback(inputSize: Size, surface: Surface?) {
+        try {
+            createVirtualDisplayUsingDisplayManager(inputSize, surface)
+        } catch (dmException: Exception) {
+            Ln.w("DisplayManager API failed, falling back to SurfaceControl")
+            try {
+                createVirtualDisplayUsingSurfaceControl(inputSize, surface)
+            } catch (scException: Exception) {
+                Ln.e("DisplayManager API failed", dmException)
+                Ln.e("SurfaceControl API failed", scException)
+                throw IOException("Failed to create virtual display with both methods")
+            }
+        }
+    }
+
+    /**
+     * 使用 DisplayManager API 创建虚拟显示器 (推荐方式)
+     */
+    private fun createVirtualDisplayUsingDisplayManager(inputSize: Size, surface: Surface?) {
+        virtualDisplay = displayManager?.createVirtualDisplay(
+            "scrcpy",
+            inputSize.width,
+            inputSize.height,
+            displayId,
+            surface
+        ) ?: throw IllegalStateException("DisplayManager not available")
+
+        Ln.d("Virtual display created using DisplayManager API")
+    }
+
+    /**
+     * 使用 SurfaceControl API 创建虚拟显示器 (备用方式)
+     */
+    private fun createVirtualDisplayUsingSurfaceControl(inputSize: Size, surface: Surface?) {
+        display = createSecureDisplay()
+
+        val deviceSize = displayInfo!!.size
+        val layerStack = displayInfo!!.layerStack
+
+        configureSurfaceControlDisplay(
+            display!!,
+            surface,
+            deviceSize.toRect(),
+            inputSize.toRect(),
+            layerStack
+        )
+
+        Ln.d("Virtual display created using SurfaceControl API")
+    }
+
+    /**
+     * 通知监听器虚拟显示器已创建
+     */
+    private fun notifyVirtualDisplayCreated(inputSize: Size) {
+        vdListener ?: return
+
+        val (virtualDisplayId, positionMapper) = when {
+            virtualDisplay == null || displayId == 0 -> {
+                // SurfaceControl 或主显示器
+                val deviceSize = displayInfo!!.size
+                Pair(displayId, size?.let { PositionMapper.create(it, transform, deviceSize) })
+            }
+            else -> {
+                // 虚拟显示器
+                Pair(
+                    virtualDisplay!!.display.displayId,
+                    size?.let { PositionMapper.create(it, transform, inputSize) }
+                )
+            }
+        }
+
+        vdListener.onNewVirtualDisplay(virtualDisplayId, positionMapper)
+    }
+
+    // ==================== 伴生对象 ====================
+
+    companion object {
+        /**
+         * 创建安全显示器
+         * Android 11 及以下允许安全显示,Android 12+ 禁止 shell 进程创建安全显示
+         */
+        @Throws(Exception::class)
+        private fun createSecureDisplay(): IBinder {
+            val secure = Build.VERSION.SDK_INT < AndroidVersions.API_30_ANDROID_11 ||
+                    (Build.VERSION.SDK_INT == AndroidVersions.API_30_ANDROID_11 &&
+                            Build.VERSION.CODENAME != "S")
+            return SurfaceControl.createDisplay("scrcpy", secure)
+        }
+
+        /**
+         * 配置 SurfaceControl 显示器参数
+         */
+        private fun configureSurfaceControlDisplay(
             display: IBinder,
             surface: Surface?,
             deviceRect: Rect,
             displayRect: Rect,
             layerStack: Int
         ) {
-            openTransaction()
+            SurfaceControl.openTransaction()
             try {
-                setDisplaySurface(display, surface)
-                setDisplayProjection(display, 0, deviceRect, displayRect)
-                setDisplayLayerStack(display, layerStack)
+                SurfaceControl.setDisplaySurface(display, surface)
+                SurfaceControl.setDisplayProjection(display, 0, deviceRect, displayRect)
+                SurfaceControl.setDisplayLayerStack(display, layerStack)
             } finally {
-                closeTransaction()
+                SurfaceControl.closeTransaction()
             }
         }
     }

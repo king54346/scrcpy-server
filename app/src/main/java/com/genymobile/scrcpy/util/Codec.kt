@@ -19,7 +19,7 @@ interface Codec {
     companion object {
         fun getMimeType(codec: MediaCodec): String? {
             val types = codec.codecInfo.supportedTypes
-            return if (types.size > 0) types[0] else null
+            return if (types.isNotEmpty()) types[0] else null
         }
     }
 }

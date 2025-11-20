@@ -84,7 +84,7 @@ object Server {
     @Throws(IOException::class, ConfigurationException::class)
     private fun scrcpy(options: Options) {
         validateOptions(options)
-
+        // cleanup monitor 进程
         val cleanUp = if (options.cleanup) CleanUp.start(options) else null
         Workarounds.apply()
 
@@ -175,16 +175,16 @@ object Server {
             //            如果是直接音频源 → 使用 AudioDirectCapture
             AudioDirectCapture(options.audioSource)
         } else {
-            //      否则 → 使用 AudioPlaybackCapture（音频重定向/复制）
+            //  否则 → 使用 AudioPlaybackCapture（音频重定向/复制）
             AudioPlaybackCapture(options.audioDup)
         }
-            //        创建音频流传输器 (audioStreamer
+            //  创建音频流传输器 (audioStreamer
         val audioStreamer = connection.audioFd?.let {
             Streamer(it, options.audioCodec, options.sendCodecMeta, options.sendFrameMeta)
         } ?: throw IllegalStateException("Audio enabled but no audio stream")
             //    创建音频录制/编码器 (audioRecorder
         val audioRecorder = when (options.audioCodec) {
-            //  如果编码格式是 RAW（原始音频）→ 使用 AudioRawRecorder 直接录制
+            //  如果编码格式是 RAW（原始音频）→  AudioRawRecorder 直接录制
             AudioCodec.RAW -> AudioRawRecorder(audioCapture, audioStreamer)
             //  其他格式（如 AAC、Opus）→ 使用 AudioEncoder 进行编码
             else -> AudioEncoder(audioCapture, audioStreamer, options)
@@ -202,8 +202,9 @@ object Server {
         val videoStreamer = connection.videoFd?.let {
             Streamer(it, options.videoCodec, options.sendCodecMeta, options.sendFrameMeta)
         } ?: throw IllegalStateException("Video enabled but no video stream")
-
+        // 创建屏幕捕获对象
         val surfaceCapture = createSurfaceCapture(options, controller)
+        //创建 Surface 编码器
         val surfaceEncoder = SurfaceEncoder(surfaceCapture, videoStreamer, options)
 
         asyncProcessors.add(surfaceEncoder)
@@ -214,18 +215,22 @@ object Server {
         options: Options,
         controller: Controller?
     ): SurfaceCapture {
+        // 2 种视频源： 显示器源和摄像头源
         return when (options.videoSource) {
+            // 分2中情况: 创建新显示器  捕获现有显示器
             VideoSource.DISPLAY -> {
                 options.newDisplay?.let {
+                    //  创建一个新的虚拟显示器并捕获
                     NewDisplayCapture(controller, options)
                 } ?: run {
                     check(options.displayId != Device.DISPLAY_ID_NONE) {
                         "Display ID must be specified"
                     }
+                    // 捕获现有显示器, 通过 options中的displayId
                     ScreenCapture(controller, options)
                 }
             }
-
+            //   对于非显示器的视频源(比如摄像头) 使用 CameraCapture 进行捕获
             else -> CameraCapture(options)
         }
     }
@@ -245,9 +250,7 @@ object Server {
         cleanUp: CleanUp?
     ) {
         cleanUp?.interrupt()
-
-        // 注意：asyncProcessors 在此作用域不可用
-        // 需要在调用方保存引用或重构代码结构
+        // todo  停止所有的  asyncProcessors
         OpenGLRunner.quit()
         connection.shutdown()
 

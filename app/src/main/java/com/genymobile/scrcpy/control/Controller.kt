@@ -14,7 +14,6 @@ import android.view.MotionEvent.PointerProperties
 import androidx.annotation.RequiresApi
 import com.genymobile.scrcpy.AndroidVersions
 import com.genymobile.scrcpy.AsyncProcessor
-import com.genymobile.scrcpy.AsyncProcessor.TerminationListener
 import com.genymobile.scrcpy.CleanUp
 import com.genymobile.scrcpy.Options
 import com.genymobile.scrcpy.device.Device
@@ -51,11 +50,9 @@ import com.genymobile.scrcpy.wrappers.InputManager.Companion.setActionButton
 import com.genymobile.scrcpy.wrappers.ServiceManager.activityManager
 import com.genymobile.scrcpy.wrappers.ServiceManager.clipboardManager
 import com.genymobile.scrcpy.wrappers.ServiceManager.displayManager
+import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
 import java.io.IOException
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
-import java.util.concurrent.ScheduledExecutorService
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
@@ -63,29 +60,23 @@ class Controller(
     private val controlChannel: ControlChannel,
     private val cleanUp: CleanUp?,
     options: Options
-) :
-    AsyncProcessor, VirtualDisplayListener {
-    /*
-        * For event injection, there are two display ids:
-        *  - the displayId passed to the constructor (which comes from --display-id passed by the client, 0 for the main display);
-        *  - the virtualDisplayId used for mirroring, notified by the capture instance via the VirtualDisplayListener interface.
-        *
-        * (In case the ScreenCapture uses the "SurfaceControl API", then both ids are equals, but this is an implementation detail.)
-        *
-        * In order to make events work correctly in all cases:
-        *  - virtualDisplayId must be used for events relative to the display (mouse and touch events with coordinates);
-        *  - displayId must be used for other events (like key events).
-        *
-        * If a new separate virtual display is created (using --new-display), then displayId == Device.DISPLAY_ID_NONE. In that case, all events are
-        * sent to the virtual display id.
-        */
+) : AsyncProcessor, VirtualDisplayListener {
+
     private class DisplayData(val virtualDisplayId: Int, positionMapper: PositionMapper) {
         val positionMapper: PositionMapper = positionMapper
     }
 
-    private var startAppExecutor: ExecutorService? = null
+    // 协程作用域
+    private val controllerScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-    private var thread: Thread? = null
+    // 用于延迟关闭屏幕的协程作用域（模拟原版的静态ScheduledExecutorService）
+    private val schedulerScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    // 启动应用的协程调度器（单线程，等价于原版的Executors.newSingleThreadExecutor()）
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val startAppDispatcher = Dispatchers.IO.limitedParallelism(1)
+
+    private var controlJob: Job? = null
 
     private var uhidManager: UhidManager? = null
 
@@ -100,7 +91,7 @@ class Controller(
     private val isSettingClipboard = AtomicBoolean()
 
     private val displayData = AtomicReference<DisplayData>()
-    private val displayDataAvailable = Any() // condition variable
+    private val displayDataChannel = Channel<DisplayData>(Channel.CONFLATED)
 
     private var lastTouchDown: Long = 0
     private val pointersState: PointersState = PointersState()
@@ -109,7 +100,6 @@ class Controller(
 
     private var keepDisplayPowerOff = false
 
-    // Used for resetting video encoding on RESET_VIDEO message
     private var surfaceCapture: SurfaceCapture? = null
 
     init {
@@ -121,14 +111,11 @@ class Controller(
             w("Input events are not supported for secondary displays before Android 10")
         }
 
-        // Make sure the clipboard manager is always created from the main thread (even if clipboardAutosync is disabled)
         val clipboardManager = clipboardManager
         if (clipboardAutosync) {
-            // If control and autosync are enabled, synchronize Android clipboard to the computer automatically
             if (clipboardManager != null) {
                 clipboardManager.addPrimaryClipChangedListener(OnPrimaryClipChangedListener {
                     if (isSettingClipboard.get()) {
-                        // This is a notification for the change we are currently applying, ignore it
                         return@OnPrimaryClipChangedListener
                     }
                     val text = clipboardText
@@ -148,9 +135,7 @@ class Controller(
         val old = displayData.getAndSet(data)
         if (old == null) {
             // The very first time the Controller is notified of a new virtual display
-            synchronized(displayDataAvailable) {
-                (displayDataAvailable as Object).notify()
-            }
+            displayDataChannel.trySend(data!!)
         }
     }
 
@@ -163,23 +148,21 @@ class Controller(
             var uhidDisplayId = displayId
             if (Build.VERSION.SDK_INT >= AndroidVersions.API_35_ANDROID_15) {
                 if (displayId == Device.DISPLAY_ID_NONE) {
-                    // Mirroring a new virtual display id (using --new-display-id feature) on Android >= 15, where the UHID mouse pointer can be
-                    // associated to the virtual display
-                    try {
-                        // Wait for at most 1 second until a virtual display id is known
-                        val data = waitDisplayData(1000)
-                        if (data != null) {
-                            uhidDisplayId = data.virtualDisplayId
+                    runBlocking {
+                        try {
+                            val data = waitDisplayData(1000)
+                            if (data != null) {
+                                uhidDisplayId = data.virtualDisplayId
+                            }
+                        } catch (e: TimeoutCancellationException) {
+                            // do nothing
                         }
-                    } catch (e: InterruptedException) {
-                        // do nothing
                     }
                 }
             }
 
             var displayUniqueId: String? = null
             if (uhidDisplayId > 0) {
-                // Ignore Device.DISPLAY_ID_NONE and 0 (main display)
                 val displayInfo = displayManager!!.getDisplayInfo(uhidDisplayId)
                 if (displayInfo != null) {
                     displayUniqueId = displayInfo.uniqueId
@@ -206,31 +189,24 @@ class Controller(
     }
 
     @RequiresApi(Build.VERSION_CODES.Q)
-    @Throws(IOException::class)
-    private fun control() {
+    private suspend fun control() {
         // on start, power on the device
         if (powerOn && displayId == 0 && !isScreenOn(displayId)) {
             pressReleaseKeycode(KeyEvent.KEYCODE_POWER, displayId, Device.INJECT_MODE_ASYNC)
 
             // dirty hack
-            // After POWER is injected, the device is powered on asynchronously.
-            // To turn the device screen off while mirroring, the client will send a message that
-            // would be handled before the device is actually powered on, so its effect would
-            // be "canceled" once the device is turned back on.
-            // Adding this delay prevents to handle the message before the device is actually
-            // powered on.
-            SystemClock.sleep(500)
+            delay(500)
         }
 
         var alive = true
-        while (!Thread.currentThread().isInterrupted && alive) {
+        while (currentCoroutineContext().isActive && alive) {
             alive = handleEvent()
         }
     }
 
     @RequiresApi(Build.VERSION_CODES.Q)
-    override fun start(listener: TerminationListener?) {
-        thread = Thread({
+    override fun start(listener: AsyncProcessor.TerminationListener?) {
+        controlJob = controllerScope.launch {
             try {
                 control()
             } catch (e: IOException) {
@@ -238,36 +214,32 @@ class Controller(
             } finally {
                 d("Controller stopped")
                 uhidManager?.closeAll()
-                if (listener != null) {
-                    listener.onTerminated(true)
-                }
+                listener?.onTerminated(true)
             }
-        }, "control-recv")
-        thread!!.start()
+        }
         sender.start()
     }
 
     override fun stop() {
-        if (thread != null) {
-            thread!!.interrupt()
-        }
+        controlJob?.cancel()
         sender.stop()
     }
 
     @Throws(InterruptedException::class)
     override fun join() {
-        if (thread != null) {
-            thread!!.join()
+        runBlocking {
+            controlJob?.join()
         }
         sender.join()
     }
 
     @RequiresApi(Build.VERSION_CODES.Q)
-    @Throws(IOException::class)
-    private fun handleEvent(): Boolean {
+    private suspend fun handleEvent(): Boolean {
         val msg: ControlMessage
         try {
-            msg = controlChannel.recv()
+            msg = withContext(Dispatchers.IO) {
+                controlChannel.recv()
+            }
         } catch (e: IOException) {
             // this is expected on close
             return false
@@ -284,7 +256,7 @@ class Controller(
             }
 
             ControlMessage.TYPE_INJECT_TEXT -> if (supportsInputEvents) {
-                msg.text?.let { injectText(it) }
+                injectText(msg.text)
             }
 
             ControlMessage.TYPE_INJECT_TOUCH_EVENT -> if (supportsInputEvents) {
@@ -324,7 +296,9 @@ class Controller(
                 msg.paste,
                 msg.sequence
             )
-
+            // alt+o 关闭手机屏幕 (turn screen OFF)
+            // alt+shift+o 打开手机屏幕
+            // alt+p 打开虚拟屏幕
             ControlMessage.TYPE_SET_DISPLAY_POWER -> if (supportsInputEvents) {
                 setDisplayPower(msg.on)
             }
@@ -348,7 +322,7 @@ class Controller(
 
             ControlMessage.TYPE_UHID_DESTROY -> getUhidManager()?.close(msg.id)
             ControlMessage.TYPE_OPEN_HARD_KEYBOARD_SETTINGS -> openHardKeyboardSettings()
-            ControlMessage.TYPE_START_APP -> msg.text?.let { startAppAsync(it) }
+            ControlMessage.TYPE_START_APP -> msg.text.let { startAppAsync(it) }
             ControlMessage.TYPE_RESET_VIDEO -> resetVideo()
             else -> {}
         }
@@ -366,7 +340,7 @@ class Controller(
 
     private fun injectChar(c: Char): Boolean {
         val decomposed: String = KeyComposition.decompose(c).toString()
-        val chars = decomposed?.toCharArray() ?: charArrayOf(c)
+        val chars = decomposed.toCharArray()
         val events = charMap.getEvents(chars) ?: return false
 
         val actionDisplayId = actionDisplayId
@@ -391,17 +365,14 @@ class Controller(
     }
 
     private fun getEventPointAndDisplayId(position: Position): Pair<Point, Int>? {
-        // it hides the field on purpose, to read it with atomic access
         val displayData = displayData.get()
-        // In scrcpy, displayData should never be null (a touch event can only be generated from the client when a video frame is present).
-        // However, it is possible to send events without video playback when using scrcpy-server alone (except for virtual displays).
         assert(displayData != null || displayId != Device.DISPLAY_ID_NONE) { "Cannot receive a positional event without a display" }
 
         val point: Point
         val targetDisplayId: Int
         if (displayData != null) {
-            point = displayData.positionMapper.map(position)!!
-            if (point == null) {
+            val mappedPoint = displayData.positionMapper.map(position)
+            if (mappedPoint == null) {
                 if (isEnabled(Ln.Level.VERBOSE)) {
                     val eventSize = position.screenSize
                     val currentSize: Size = displayData.positionMapper.videoSize
@@ -409,9 +380,9 @@ class Controller(
                 }
                 return null
             }
+            point = mappedPoint
             targetDisplayId = displayData.virtualDisplayId
         } else {
-            // No display, use the raw coordinates
             point = position.point
             targetDisplayId = displayId
         }
@@ -442,21 +413,18 @@ class Controller(
             return false
         }
         val pointer: Pointer = pointersState.get(pointerIndex)
-        pointer.point=point
-        pointer.pressure=pressure
+        pointer.point = point
+        pointer.pressure = pressure
         val source: Int
         val activeSecondaryButtons =
             ((actionButton or buttons) and MotionEvent.BUTTON_PRIMARY.inv()) != 0
         if (pointerId == POINTER_ID_MOUSE.toLong() && (action == MotionEvent.ACTION_HOVER_MOVE || activeSecondaryButtons)) {
-            // real mouse event, or event incompatible with a finger
             pointerProperties[pointerIndex]!!.toolType = MotionEvent.TOOL_TYPE_MOUSE
             source = InputDevice.SOURCE_MOUSE
-            pointer.isUp = buttons==0
+            pointer.isUp = buttons == 0
         } else {
-            // POINTER_ID_GENERIC_FINGER, POINTER_ID_VIRTUAL_FINGER or real touch from device
             pointerProperties[pointerIndex]!!.toolType = MotionEvent.TOOL_TYPE_FINGER
             source = InputDevice.SOURCE_TOUCHSCREEN
-            // Buttons must not be set for touch events
             buttons = 0
             pointer.isUp = action == MotionEvent.ACTION_UP
         }
@@ -467,7 +435,6 @@ class Controller(
                 lastTouchDown = now
             }
         } else {
-            // secondary pointers must use ACTION_POINTER_* ORed with the pointerIndex
             if (action == MotionEvent.ACTION_UP) {
                 action =
                     MotionEvent.ACTION_POINTER_UP or (pointerIndex shl MotionEvent.ACTION_POINTER_INDEX_SHIFT)
@@ -477,18 +444,9 @@ class Controller(
             }
         }
 
-        /* If the input device is a mouse (on API >= 23):
-         *   - the first button pressed must first generate ACTION_DOWN;
-         *   - all button pressed (including the first one) must generate ACTION_BUTTON_PRESS;
-         *   - all button released (including the last one) must generate ACTION_BUTTON_RELEASE;
-         *   - the last button released must in addition generate ACTION_UP.
-         *
-         * Otherwise, Chrome does not work properly: <https://github.com/Genymobile/scrcpy/issues/3635>
-         */
-        if (Build.VERSION.SDK_INT >= AndroidVersions.API_23_ANDROID_6_0 && source == InputDevice.SOURCE_MOUSE) {
+        if (source == InputDevice.SOURCE_MOUSE) {
             if (action == MotionEvent.ACTION_DOWN) {
                 if (actionButton == buttons) {
-                    // First button pressed: ACTION_DOWN
                     val downEvent = MotionEvent.obtain(
                         lastTouchDown,
                         now,
@@ -510,7 +468,6 @@ class Controller(
                     }
                 }
 
-                // Any button pressed: ACTION_BUTTON_PRESS
                 val pressEvent = MotionEvent.obtain(
                     lastTouchDown,
                     now,
@@ -538,7 +495,6 @@ class Controller(
             }
 
             if (action == MotionEvent.ACTION_UP) {
-                // Any button released: ACTION_BUTTON_RELEASE
                 val releaseEvent = MotionEvent.obtain(
                     lastTouchDown,
                     now,
@@ -563,7 +519,6 @@ class Controller(
                 }
 
                 if (buttons == 0) {
-                    // Last button released: ACTION_UP
                     val upEvent = MotionEvent.obtain(
                         lastTouchDown, now, MotionEvent.ACTION_UP, pointerCount, pointerProperties,
                         pointerCoords, 0, buttons, 1f, 1f, DEFAULT_DEVICE_ID, 0, source, 0
@@ -642,10 +597,7 @@ class Controller(
             return injectKeyEvent(action, KeyEvent.KEYCODE_BACK, 0, 0, Device.INJECT_MODE_ASYNC)
         }
 
-        // Screen is off
-        // Only press POWER on ACTION_DOWN
         if (action != KeyEvent.ACTION_DOWN) {
-            // do nothing,
             return true
         }
 
@@ -657,17 +609,12 @@ class Controller(
     }
 
     private fun getClipboard(copyKey: Int) {
-        // On Android >= 7, press the COPY or CUT key if requested
-        if (copyKey != ControlMessage.COPY_KEY_NONE && Build.VERSION.SDK_INT >= AndroidVersions.API_24_ANDROID_7_0 && supportsInputEvents) {
+        if (copyKey != ControlMessage.COPY_KEY_NONE && supportsInputEvents) {
             val key =
                 if (copyKey == ControlMessage.COPY_KEY_COPY) KeyEvent.KEYCODE_COPY else KeyEvent.KEYCODE_CUT
-            // Wait until the event is finished, to ensure that the clipboard text we read just after is the correct one
             pressReleaseKeycode(key, Device.INJECT_MODE_WAIT_FOR_FINISH)
         }
 
-        // If clipboard autosync is enabled, then the device clipboard is synchronized to the computer clipboard whenever it changes, in
-        // particular when COPY or CUT are injected, so it should not be synchronized twice. On Android < 7, do not synchronize at all rather than
-        // copying an old clipboard content.
         if (!clipboardAutosync) {
             val clipboardText = clipboardText
             if (clipboardText != null) {
@@ -685,13 +632,11 @@ class Controller(
             i("Device clipboard set")
         }
 
-        // On Android >= 7, also press the PASTE key if requested
-        if (paste && Build.VERSION.SDK_INT >= AndroidVersions.API_24_ANDROID_7_0 && supportsInputEvents) {
+        if (paste && supportsInputEvents) {
             pressReleaseKeycode(KeyEvent.KEYCODE_PASTE, Device.INJECT_MODE_ASYNC)
         }
 
         if (sequence != ControlMessage.SEQUENCE_INVALID) {
-            // Acknowledgement requested
             val msg: DeviceMessage = DeviceMessage.createAckClipboard(sequence)
             sender.send(msg)
         }
@@ -727,25 +672,19 @@ class Controller(
     private val actionDisplayId: Int
         get() {
             if (displayId != Device.DISPLAY_ID_NONE) {
-                // Real screen mirrored, use the source display id
                 return displayId
             }
 
-            // Virtual display created by --new-display, use the virtualDisplayId
             val data = displayData.get()
-                ?: // If no virtual display id is initialized yet, use the main display id
-                return 0
+                ?: return 0
 
             return data.virtualDisplayId
         }
 
     private fun startAppAsync(name: String) {
-        if (startAppExecutor == null) {
-            startAppExecutor = Executors.newSingleThreadExecutor()
+        controllerScope.launch(startAppDispatcher) {
+            startApp(name)
         }
-
-        // Listing and selecting the app may take a lot of time
-        startAppExecutor!!.submit { startApp(name) }
     }
 
     private fun startApp(name: String) {
@@ -798,48 +737,32 @@ class Controller(
                 return displayId
             }
 
-            // Mirroring a new virtual display id (using --new-display-id feature)
-            try {
-                // Wait for at most 1 second until a virtual display id is known
-                val data = waitDisplayData(1000)
-                if (data != null) {
-                    return data.virtualDisplayId
+            return runBlocking {
+                try {
+                    val data = waitDisplayData(1000)
+                    data?.virtualDisplayId ?: Device.DISPLAY_ID_NONE
+                } catch (e: TimeoutCancellationException) {
+                    Device.DISPLAY_ID_NONE
                 }
-            } catch (e: InterruptedException) {
-                // do nothing
             }
-
-            // No display id available
-            return Device.DISPLAY_ID_NONE
         }
 
-    @Throws(InterruptedException::class)
-    private fun waitDisplayData(timeoutMillis: Long): DisplayData? {
-        val deadline = System.currentTimeMillis() + timeoutMillis
-
-        synchronized(displayDataAvailable) {
+    private suspend fun waitDisplayData(timeoutMillis: Long): DisplayData? {
+        return withTimeoutOrNull(timeoutMillis) {
             var data = displayData.get()
-            while (data == null) {
-                val timeout = deadline - System.currentTimeMillis()
-                if (timeout < 0) {
-                    return null
-                }
-                if (timeout > 0) {
-                    (displayDataAvailable as Object).wait(timeout)
-                }
-                data = displayData.get()
+            if (data != null) {
+                data
+            } else {
+                displayDataChannel.receive()
             }
-            return data
         }
     }
 
     @RequiresApi(Build.VERSION_CODES.Q)
     private fun setDisplayPower(on: Boolean) {
-        // Change the power of the main display when mirroring a virtual display
         val targetDisplayId = if (displayId != Device.DISPLAY_ID_NONE) displayId else 0
         val setDisplayPowerOk = setDisplayPower(targetDisplayId, on)
         if (setDisplayPowerOk) {
-            // Do not keep display power off for virtual displays: MOD+p must wake up the physical device
             keepDisplayPowerOff = displayId != Device.DISPLAY_ID_NONE && !on
             i("Device display turned " + (if (on) "on" else "off"))
             if (cleanUp != null) {
@@ -858,22 +781,15 @@ class Controller(
 
     companion object {
         private const val DEFAULT_DEVICE_ID = 0
-
-        // control_msg.h values of the pointerId field in inject_touch_event message
         private const val POINTER_ID_MOUSE = -1
 
-        private val EXECUTOR: ScheduledExecutorService =
-            Executors.newSingleThreadScheduledExecutor()
-
-        /**
-         * Schedule a call to set display power to off after a small delay.
-         */
+        @OptIn(DelicateCoroutinesApi::class)
         private fun scheduleDisplayPowerOff(displayId: Int) {
-            EXECUTOR.schedule({
+            GlobalScope.launch {
+                delay(200)
                 i("Forcing display off")
                 setDisplayPower(displayId, false)
-            }, 200, TimeUnit.MILLISECONDS)
+            }
         }
     }
-
 }

@@ -3,7 +3,6 @@ package com.genymobile.scrcpy.audio
 import android.media.MediaCodec
 import android.os.Build
 import androidx.annotation.RequiresApi
-import com.genymobile.scrcpy.AndroidVersions
 import com.genymobile.scrcpy.AsyncProcessor
 import com.genymobile.scrcpy.device.Streamer
 import com.genymobile.scrcpy.util.IO.isBrokenPipe
@@ -13,20 +12,31 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.isActive
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.buffer
+import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.onCompletion
+import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.yield
 import java.io.IOException
 import java.nio.ByteBuffer
 
 /**
- * 音频原始数据录制器 (协程版本)
+ * 音频原始数据录制器 (Flow 版本)
  *
- * 使用 Kotlin 协程替代传统线程，提供更好的结构化并发和资源管理。
+ * 使用 Kotlin Flow 实现反应式音频数据流处理:
+ * ```
+ * 音频捕获 Flow
+ *   ↓ 读取原始音频数据
+ *   ↓ 检查数据有效性
+ *   ↓ 发送到网络
+ * ```
  *
  * @property capture 音频捕获器
  * @property streamer 网络流传输器
@@ -40,16 +50,82 @@ class AudioRawRecorder(
     private var recordJob: Job? = null
 
     /**
-     * 录制音频的主循环
+     * 音频数据包
      */
-    @RequiresApi(Build.VERSION_CODES.R)
-    @Throws(IOException::class, AudioCaptureException::class)
-    private suspend fun record() {
-        // 版本检查
+    private data class AudioPacket(
+        val buffer: ByteBuffer,
+        val bufferInfo: MediaCodec.BufferInfo
+    )
 
+    /**
+     * 创建音频捕获流
+     *
+     * 持续从音频捕获器读取数据并生成数据包流
+     */
+    private fun createAudioCaptureFlow(): Flow<AudioPacket> = callbackFlow {
         val buffer = ByteBuffer.allocateDirect(AudioConfig.MAX_READ_SIZE)
         val bufferInfo = MediaCodec.BufferInfo()
 
+        try {
+            while (true) {
+                // 重置缓冲区
+                buffer.position(0)
+
+                // 读取音频数据
+                val bytesRead = capture.read(buffer, bufferInfo)
+
+                if (bytesRead < 0) {
+                    close(IOException("Could not read audio: $bytesRead"))
+                    break
+                }
+
+                // 设置缓冲区限制
+                buffer.limit(bytesRead)
+
+                // 复制数据（避免缓冲区重用问题）
+                val packetBuffer = ByteBuffer.allocateDirect(bytesRead)
+                packetBuffer.put(buffer)
+                packetBuffer.flip()
+
+                val packetInfo = MediaCodec.BufferInfo()
+                packetInfo.set(
+                    bufferInfo.offset,
+                    bufferInfo.size,
+                    bufferInfo.presentationTimeUs,
+                    bufferInfo.flags
+                )
+
+                // 发送数据包
+                trySend(AudioPacket(packetBuffer, packetInfo))
+            }
+        } catch (e: Exception) {
+            close(e)
+        }
+
+        awaitClose {
+            Ln.d("Audio capture flow closed")
+        }
+    }
+
+    /**
+     * 创建音频发送管道
+     *
+     * 将音频数据包发送到网络
+     */
+    private fun createSendPipeline(
+        audioFlow: Flow<AudioPacket>
+    ): Flow<AudioPacket> = audioFlow
+        .onEach { packet ->
+            streamer.writePacket(packet.buffer, packet.bufferInfo)
+        }
+        .buffer(capacity = 64) // 背压缓冲
+
+    /**
+     * 录制音频的主流程
+     */
+    @RequiresApi(Build.VERSION_CODES.R)
+    @Throws(IOException::class, AudioCaptureException::class)
+    private suspend fun record() = withContext(Dispatchers.IO) {
         try {
             // 启动音频捕获
             try {
@@ -63,33 +139,47 @@ class AudioRawRecorder(
             // 发送音频头部
             streamer.writeAudioHeader()
 
-            // 录制循环 - 使用 coroutineScope 确保在协程上下文中
-            coroutineScope {
-                while (isActive) {
-                    buffer.position(0)
-                    val bytesRead = capture.read(buffer, bufferInfo)
+            // 创建音频流
+            val audioFlow = createAudioCaptureFlow()
 
-                    if (bytesRead < 0) {
-                        throw IOException("Could not read audio: $bytesRead")
-                    }
+            // 创建发送管道
+            val sendPipeline = createSendPipeline(audioFlow)
 
-                    buffer.limit(bytesRead)
-                    streamer.writePacket(buffer, bufferInfo)
-
-                    // 让出执行权
-                    yield()
+            // 收集并处理音频流
+            sendPipeline
+                .onStart {
+                    Ln.d("Audio recording started")
                 }
-            }
+                .catch { e ->
+                    when (e) {
+                        is CancellationException -> {
+                            Ln.d("Audio recording cancelled")
+                            throw e
+                        }
+                        is IOException -> {
+                            if (!isBrokenPipe(e)) {
+                                Ln.e("Audio capture error", e)
+                                throw e
+                            }
+                        }
+                        else -> {
+                            Ln.e("Unexpected error in audio pipeline", e)
+                            throw e
+                        }
+                    }
+                }
+                .onCompletion { cause ->
+                    Ln.d("Audio recording completed: ${cause?.message ?: "normally"}")
+                }
+                .collect { }
 
-        } catch (e: CancellationException) {
-            Ln.d("Audio recording cancelled")
-            throw e
-        } catch (e: IOException) {
-            if (!isBrokenPipe(e)) {
-                Ln.e("Audio capture error", e)
-            }
         } finally {
-            capture.stop()
+            // 停止音频捕获
+            try {
+                capture.stop()
+            } catch (e: Exception) {
+                Ln.w("Error stopping capture", e)
+            }
         }
     }
 
@@ -116,6 +206,7 @@ class AudioRawRecorder(
 
     override fun stop() {
         recordJob?.cancel()
+        recordScope.cancel()
     }
 
     @Throws(InterruptedException::class)

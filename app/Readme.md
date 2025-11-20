@@ -117,6 +117,10 @@ UriCompat - Uri 兼容
 ConnectivityManagerCompat - 网络连接管理
 MailTo - 邮件链接解析
 
+app_process 反射调用场景：
+    调用 @hide 的API（编译时不可见）
+    直接访问系统服务的 Binder 接口
+
 
 音频同步： 1. rarRecorder 原始音频 2. audioEncoder 编码音频
 1. rarRecorder 原始音频
@@ -159,3 +163,57 @@ MailTo - 邮件链接解析
     ByteBuffer outputBuffer = codec.getOutputBuffer(outputIndex);
     streamer.writePacket(buffer, task.bufferInfo);
 ```
+
+视频虚拟显示:
+VirtualDisplay 创建一个“虚拟”的显示设备可以将系统UI（通常是某个应用或屏幕）的内容，投射到一个你提供的 Surface 上
+所有渲染到 VirtualDisplay 的图像数据，都会被自动“输送”到你提供的那个 Surface 上。你对这个 Surface 拥有完全的控制权——你可以将它显示在另一个 View 上、编码成视频、通过网络流式传输，或者进行图像分析。
+```java
+//1. 准备一个 Surface，这里连接到视频编码器 
+Surface inputSurface = mediaCodec.createInputSurface();
+//2. 创建 VirtualDisplay！将屏幕内容镜像到Surface 上  
+mediaProjection.createVirtualDisplay(inputSurface)
+//3. 启动编码器，对surface内容进行编码操作,开始录制 
+mediaCodec.start();
+//4. 处理编码后的数据
+mediaCodec.dequeueOutputBuffer(bufferInfo, timeoutUs); 
+//处理编码后的输出 
+mediaCodec.releaseOutputBuffer(outputBufferId, false);
+```
+
+捕获现有显示器:
+
+1. 从一个已存在的镜像display中创建虚拟显示
+通过直接反射dm的createVirtualDisplay(@NonNull String name, int width, int height, int displayIdToMirror, @Nullable Surface surface)去实现
+因为这个方法是systemapi,需要获取权限才能够通过dm调用,普通应用通过MediaProjection获取授权调用
+
+2. android11 以下实现:
+通过反射调用SurfaceControl类的隐藏方法createDisplay()，用于创建虚拟显示器
+// 1. 获取Class对象
+val surfaceControlClass = Class.forName("android.view.SurfaceControl")
+// 2. 获取Method对象 创建的是显示系统中的一个"显示设备"
+val createDisplayMethod = surfaceControlClass.getMethod(
+"createDisplay",
+String::class.java,
+Boolean::class.javaPrimitiveType
+)
+// 3. 调用静态方法 (第一个参数null表示静态方法)
+val result = createDisplayMethod.invoke(null, "scrcpy", false)
+
+// 4. 转换结果为IBinder
+return result as IBinder
+
+createDisplay 需要手动指定从哪个物理显示镜像内容
+
+
+
+
+
+
+
+
+-------------------------------------------------------------------------
+System.loadLibrary("myapplication") 是在加载 C++ 编译出来的动态库（.so 文件）。
+cmake中  project("myapplication")
+GameActivity中super.onCreate() 启动 Native 线程 通过 android_app->msgwrite， android_app->msgread
+
+

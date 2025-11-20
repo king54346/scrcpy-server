@@ -8,7 +8,7 @@ import android.view.Surface
 import com.genymobile.scrcpy.AndroidVersions
 import com.genymobile.scrcpy.util.Ln
 import java.lang.reflect.Method
-
+// android 11 以下才有的功能
 @SuppressLint("PrivateApi")
 object SurfaceControl {
     private var CLASS: Class<*>? = null

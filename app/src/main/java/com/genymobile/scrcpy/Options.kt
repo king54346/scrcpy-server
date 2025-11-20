@@ -30,7 +30,7 @@ class Options {
         private set
     var videoCodec: VideoCodec = VideoCodec.H264
         private set
-    var audioCodec: AudioCodec = AudioCodec.OPUS
+    var audioCodec: AudioCodec = AudioCodec.RAW
         private set
     var videoSource: VideoSource = VideoSource.DISPLAY
         private set

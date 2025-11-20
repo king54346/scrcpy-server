@@ -7,7 +7,9 @@ import com.genymobile.scrcpy.util.Codec
 enum class VideoCodec(// 4-byte ASCII representation of the name
     override val id: Int, override val codecName: String, override val mimeType: String
 ) : Codec {
+    // avc
     H264(0x68323634, "h264", MediaFormat.MIMETYPE_VIDEO_AVC),
+    // hevc
     H265(0x68323635, "h265", MediaFormat.MIMETYPE_VIDEO_HEVC),
 
     @SuppressLint("InlinedApi")  // introduced in API 29
@@ -18,6 +20,7 @@ enum class VideoCodec(// 4-byte ASCII representation of the name
 
     companion object {
         fun findByName(name: String): VideoCodec? {
+
             for (codec in entries) {
                 if (codec.name == name) {
                     return codec

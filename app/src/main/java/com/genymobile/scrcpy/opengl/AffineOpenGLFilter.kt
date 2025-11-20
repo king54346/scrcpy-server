@@ -4,7 +4,8 @@ import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import com.genymobile.scrcpy.util.AffineMatrix
 import java.nio.FloatBuffer
-
+// 仿射变换的OpenGL滤镜
+// OpenGL ES 2.0对输入的纹理（通常是相机预览或屏幕内容）应用仿射变换（旋转、缩放、平移、错切等），并将结果渲染到帧缓冲区。
 class AffineOpenGLFilter(transform: AffineMatrix) : OpenGLFilter {
     private var program = 0
     private var vertexBuffer: FloatBuffer? = null
@@ -83,8 +84,9 @@ void main() {
         userMatrixLoc = GLES20.glGetUniformLocation(program, "user_matrix")
         assert(userMatrixLoc != -1)
     }
-
+    // 渲染阶段
     override fun draw(textureId: Int, texMatrix: FloatArray?) {
+        // 1. 使用着色器程序
         GLES20.glUseProgram(program)
         GLUtils.checkGlError()
 
@@ -92,7 +94,7 @@ void main() {
         GLUtils.checkGlError()
         GLES20.glEnableVertexAttribArray(texCoordsInLoc)
         GLUtils.checkGlError()
-
+        // 2. 设置顶点和纹理坐标属性
         GLES20.glVertexAttribPointer(vertexPosLoc, 2, GLES20.GL_FLOAT, false, 0, vertexBuffer)
         GLUtils.checkGlError()
         GLES20.glVertexAttribPointer(texCoordsInLoc, 2, GLES20.GL_FLOAT, false, 0, texCoordsBuffer)
@@ -100,17 +102,18 @@ void main() {
 
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLUtils.checkGlError()
+        // 3. 绑定纹理（注意是外部纹理OES）
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
         GLUtils.checkGlError()
         GLES20.glUniform1i(texLoc, 0)
         GLUtils.checkGlError()
-
+        // 4. 设置变换矩阵
         GLES20.glUniformMatrix4fv(texMatrixLoc, 1, false, texMatrix, 0)
         GLUtils.checkGlError()
 
         GLES20.glUniformMatrix4fv(userMatrixLoc, 1, false, userMatrix, 0)
         GLUtils.checkGlError()
-
+        // 5. 绘制
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
         GLUtils.checkGlError()
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)

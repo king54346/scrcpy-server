@@ -19,30 +19,45 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.channels.onFailure
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.isActive
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.buffer
+import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.mapNotNull
+import kotlinx.coroutines.flow.merge
+import kotlinx.coroutines.flow.onCompletion
+import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.onStart
+import kotlinx.coroutines.flow.shareIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import java.io.IOException
 
 /**
- * 音频编码器 (协程版本)
- *  audioEncoder编码音频  输入缓冲区可用(编码器内部的输入缓冲区有空闲) ---> 记录index到inputTask队列中 ---> 编码 ----> 输出缓冲区可用(getOutputBuffer)----> index和编码结果写入output队列中
- *  1. createMediaCodec
- *  2. 设置MediaCodec 回调 (通过channel发送任务通知协程)
- *  3. 输入pcm编码 mediaCodec.queueInputBuffer (读取channel协程运行)
- *  4. 读取发送  mediaCodec.getOutputBuffer(task.index)  (读取channel协程运行)
- * 使用 MediaCodec 对音频进行编码，采用协程替代多线程模型。
- * 使用 Channel 实现生产者-消费者模式，处理输入和输出缓冲区。
+ * 音频编码器 (统一 Flow 管道版本)
+ *
+ * 使用单一 Flow 管道处理所有 MediaCodec 事件:
+ * ```
+ * MediaCodec 事件 Flow (输入/输出/错误)
+ *   ↓ filter: 分离输入事件
+ *   ↓ map: 读取音频 + 送入编码器
+ *
+ * MediaCodec 事件 Flow
+ *   ↓ filter: 分离输出事件
+ *   ↓ map: 读取编码数据
+ *   ↓ map: 修复 PTS
+ *   ↓ collect: 发送到网络
+ * ```
  *
  * @property capture 音频捕获器
  * @property streamer 网络流传输器
  * @property options 编码选项
  */
-
 class AudioEncoder(
     private val capture: AudioCapture,
     private val streamer: Streamer,
@@ -61,84 +76,189 @@ class AudioEncoder(
     // 协程作用域
     private val encoderScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
-    // 任务通道
-    private val inputChannel = Channel<InputTask>(capacity = 64)
-    private val outputChannel = Channel<OutputTask>(capacity = 64)
-
-    // 协程任务
+    // 编码器任务
     private var encoderJob: Job? = null
-    private var inputJob: Job? = null
-    private var outputJob: Job? = null
 
     /**
-     * 输入任务
+     * MediaCodec 事件的密封类
+     * 使用密封类提供类型安全的事件处理
      */
-    private data class InputTask(val index: Int)
+    private sealed class CodecEvent {
+        /** 输入缓冲区可用 */
+        data class InputAvailable(val index: Int) : CodecEvent()
+
+        /** 输出缓冲区可用 */
+        data class OutputAvailable(
+            val index: Int,
+            val bufferInfo: MediaCodec.BufferInfo
+        ) : CodecEvent()
+
+        /** 输出格式变化 */
+        data class FormatChanged(val format: MediaFormat) : CodecEvent()
+
+        /** 编解码器错误 */
+        data class Error(val exception: MediaCodec.CodecException) : CodecEvent()
+    }
 
     /**
-     * 输出任务
+     * 创建统一的 MediaCodec 事件流
+     *
+     * 将所有 MediaCodec 回调转换为类型安全的事件流
      */
-    private data class OutputTask(
-        val index: Int,
-        val bufferInfo: MediaCodec.BufferInfo
-    )
+    private fun createCodecEventFlow(mediaCodec: MediaCodec): Flow<CodecEvent> = callbackFlow {
+        val callback = object : MediaCodec.Callback() {
+            override fun onInputBufferAvailable(codec: MediaCodec, index: Int) {
+                trySend(CodecEvent.InputAvailable(index))
+            }
+
+            override fun onOutputBufferAvailable(
+                codec: MediaCodec,
+                index: Int,
+                bufferInfo: MediaCodec.BufferInfo
+            ) {
+                // 复制 BufferInfo 避免被重用
+                val info = MediaCodec.BufferInfo()
+                info.set(
+                    bufferInfo.offset,
+                    bufferInfo.size,
+                    bufferInfo.presentationTimeUs,
+                    bufferInfo.flags
+                )
+                trySend(CodecEvent.OutputAvailable(index, info))
+            }
+
+            override fun onError(codec: MediaCodec, e: MediaCodec.CodecException) {
+                trySend(CodecEvent.Error(e))
+                close(e)
+            }
+
+            override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {
+                trySend(CodecEvent.FormatChanged(format))
+            }
+        }
+
+        // 注册回调
+        mediaCodec.setCallback(callback)
+
+        // 等待流被关闭
+        awaitClose {
+            Ln.d("Codec event flow closed")
+        }
+    }
 
     /**
-     * 输入协程：从音频源读取数据并送入编码器
+     * 创建输入处理流
+     *
+     * 从事件流中筛选出输入事件，读取音频数据并送入编码器
      */
-    private suspend fun inputCoroutine(
+    private fun createInputPipeline(
+        eventFlow: Flow<CodecEvent>,
         mediaCodec: MediaCodec,
         capture: AudioCapture
-    ) = coroutineScope {
-        val bufferInfo = MediaCodec.BufferInfo()
+    ): Flow<CodecEvent.InputAvailable> = eventFlow
+        .mapNotNull { event ->
+            // 只处理输入事件
+            when (event) {
+                is CodecEvent.InputAvailable -> event
+                else -> null
+            }
+        }
+        .onEach { event ->
+            // 获取输入缓冲区
+            val buffer = mediaCodec.getInputBuffer(event.index)
+                ?: throw IOException("Could not get input buffer ${event.index}")
 
-        for (task in inputChannel) {
-            // 检查取消
-            if (!isActive) break
-
-            val buffer = mediaCodec.getInputBuffer(task.index)
-                ?: throw IOException("Could not get input buffer")
-
+            // 读取音频数据
+            val bufferInfo = MediaCodec.BufferInfo()
             val bytesRead = capture.read(buffer, bufferInfo)
+
             if (bytesRead <= 0) {
                 throw IOException("Could not read audio: $bytesRead")
             }
 
+            // 送入编码器
             mediaCodec.queueInputBuffer(
-                task.index,
+                event.index,
                 bufferInfo.offset,
                 bufferInfo.size,
                 bufferInfo.presentationTimeUs,
                 bufferInfo.flags
             )
         }
-    }
+        .buffer(capacity = 64) // 背压缓冲
 
     /**
-     * 输出协程：从编码器读取数据并发送到网络
+     * 创建输出处理流
+     *
+     * 从事件流中筛选出输出事件，读取编码数据并发送到网络
      */
-    private suspend fun outputCoroutine(
+    private fun createOutputPipeline(
+        eventFlow: Flow<CodecEvent>,
         mediaCodec: MediaCodec
-    ) = coroutineScope {
-        streamer.writeAudioHeader()
-
-        for (task in outputChannel) {
-            // 检查取消
-            if (!isActive) break
-
-            val buffer = mediaCodec.getOutputBuffer(task.index)
-                ?: throw IOException("Could not get output buffer")
-
-            try {
-                if (recreatePts) {
-                    fixTimestamp(task.bufferInfo)
-                }
-                streamer.writePacket(buffer, task.bufferInfo)
-            } finally {
-                mediaCodec.releaseOutputBuffer(task.index, false)
+    ): Flow<CodecEvent.OutputAvailable> = eventFlow
+        .mapNotNull { event ->
+            // 只处理输出事件
+            when (event) {
+                is CodecEvent.OutputAvailable -> event
+                else -> null
             }
         }
-    }
+        .onEach { event ->
+            // 获取输出缓冲区
+            val buffer = mediaCodec.getOutputBuffer(event.index)
+                ?: throw IOException("Could not get output buffer ${event.index}")
+
+            try {
+                // 修复 PTS (如果需要)
+                if (recreatePts) {
+                    fixTimestamp(event.bufferInfo)
+                }
+
+                // 发送到网络
+                streamer.writePacket(buffer, event.bufferInfo)
+            } finally {
+                // 释放输出缓冲区
+                mediaCodec.releaseOutputBuffer(event.index, false)
+            }
+        }
+        .buffer(capacity = 64) // 背压缓冲
+
+    /**
+     * 创建格式变化监听流
+     *
+     * 记录输出格式变化（用于调试）
+     */
+    private fun createFormatChangePipeline(
+        eventFlow: Flow<CodecEvent>
+    ): Flow<CodecEvent.FormatChanged> = eventFlow
+        .mapNotNull { event ->
+            when (event) {
+                is CodecEvent.FormatChanged -> event
+                else -> null
+            }
+        }
+        .onEach { event ->
+            Ln.d("Output format changed: ${event.format}")
+        }
+
+    /**
+     * 创建错误处理流
+     *
+     * 捕获并处理编解码器错误
+     */
+    private fun createErrorPipeline(
+        eventFlow: Flow<CodecEvent>
+    ): Flow<CodecEvent.Error> = eventFlow
+        .mapNotNull { event ->
+            when (event) {
+                is CodecEvent.Error -> event
+                else -> null
+            }
+        }
+        .onEach { event ->
+            Ln.e("MediaCodec error: ${event.exception.message}")
+            throw event.exception
+        }
 
     /**
      * 修复时间戳
@@ -162,38 +282,6 @@ class AudioEncoder(
         }
 
         previousPts = pts
-    }
-
-    /**
-     * MediaCodec 回调（协程版本）
-     */
-    private inner class EncoderCallback : MediaCodec.Callback() {
-        override fun onInputBufferAvailable(codec: MediaCodec, index: Int) {
-            // 非阻塞发送到 channel
-            inputChannel.trySend(InputTask(index))
-                .onFailure { Ln.w("Failed to send input task") }
-        }
-
-        override fun onOutputBufferAvailable(
-            codec: MediaCodec,
-            index: Int,
-            bufferInfo: MediaCodec.BufferInfo
-        ) {
-            // 非阻塞发送到 channel
-            outputChannel.trySend(OutputTask(index, bufferInfo))
-                .onFailure { Ln.w("Failed to send output task") }
-        }
-
-        override fun onError(codec: MediaCodec, e: MediaCodec.CodecException) {
-            Ln.e("MediaCodec error", e)
-            // 关闭通道，停止所有协程
-            inputChannel.close(e)
-            outputChannel.close(e)
-        }
-
-        override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {
-            // 忽略格式变化
-        }
     }
 
     /**
@@ -226,9 +314,17 @@ class AudioEncoder(
                 "c2.android.flac.encoder"
             )
 
+            // 启动事件流
+            val eventFlow = createCodecEventFlow(mediaCodec)
+                .shareIn(
+                    scope = this,
+                    started = SharingStarted.Eagerly,  // 立即启动
+                    replay = 0
+                )
+
+
             // 配置 MediaCodec
             val format = createFormat(codec.mimeType, bitRate, codecOptions)
-            mediaCodec.setCallback(EncoderCallback())
             mediaCodec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
 
             // 启动音频捕获
@@ -238,51 +334,79 @@ class AudioEncoder(
             mediaCodec.start()
             mediaCodecStarted = true
 
-            // 启动输入和输出协程
-            coroutineScope {
-                inputJob = launch {
-                    try {
-                        inputCoroutine(mediaCodec, capture)
-                    } catch (e: CancellationException) {
-                        Ln.d("Input coroutine cancelled")
-                        throw e
-                    } catch (e: IOException) {
-                        Ln.e("Audio capture error", e)
-                        throw e
-                    }
-                }
+            // 发送音频头部
+            streamer.writeAudioHeader()
 
-                outputJob = launch {
-                    try {
-                        outputCoroutine(mediaCodec)
-                    } catch (e: CancellationException) {
-                        Ln.d("Output coroutine cancelled")
-                        throw e
-                    } catch (e: IOException) {
-                        if (!isBrokenPipe(e)) {
-                            Ln.e("Audio encoding error", e)
+            // 创建所有处理管道
+            val inputPipeline = createInputPipeline(eventFlow, mediaCodec, capture)
+            val outputPipeline = createOutputPipeline(eventFlow, mediaCodec)
+            val formatPipeline = createFormatChangePipeline(eventFlow)
+            val errorPipeline = createErrorPipeline(eventFlow)
+
+            // 启动输入处理协程
+            val inputJob = launch {
+                inputPipeline
+                    .catch { e ->
+                        if (e !is CancellationException) {
+                            Ln.e("Input pipeline error", e)
+                            throw e
                         }
-                        throw e
                     }
-                }
-
-                // 等待两个协程完成（或被取消）
-                inputJob?.join()
-                outputJob?.join()
+                    .onCompletion { cause ->
+                        Ln.d("Input pipeline completed: ${cause?.message ?: "normally"}")
+                    }
+                    .collect { }
             }
 
+            // 启动输出处理协程
+            val outputJob = launch {
+                outputPipeline
+                    .catch { e ->
+                        if (e !is CancellationException && !isBrokenPipe(e as? IOException)) {
+                            Ln.e("Output pipeline error", e)
+                            throw e
+                        }
+                    }
+                    .onCompletion { cause ->
+                        Ln.d("Output pipeline completed: ${cause?.message ?: "normally"}")
+                    }
+                    .collect { }
+            }
+
+            // 启动格式变化监听协程
+            val formatJob = launch {
+                formatPipeline
+                    .catch { e ->
+                        Ln.w("Format pipeline error", e)
+                    }
+                    .collect { }
+            }
+
+            // 启动错误处理协程
+            val errorJob = launch {
+                errorPipeline
+                    .catch { e ->
+                        Ln.e("Error pipeline failed", e)
+                        throw e
+                    }
+                    .collect { }
+            }
+
+            // 等待所有管道完成
+            inputJob.join()
+            outputJob.join()
+            formatJob.join()
+            errorJob.join()
+
         } catch (e: ConfigurationException) {
-            // 通知客户端配置错误
             streamer.writeDisableStream(true)
             throw e
         } catch (e: Throwable) {
-            // 通知客户端音频无法捕获
             if (e !is CancellationException) {
                 streamer.writeDisableStream(false)
             }
             throw e
         } finally {
-            // 清理资源
             cleanup(mediaCodec, mediaCodecStarted)
         }
     }
@@ -291,10 +415,6 @@ class AudioEncoder(
      * 清理资源
      */
     private fun cleanup(mediaCodec: MediaCodec?, mediaCodecStarted: Boolean) {
-        // 关闭通道
-        inputChannel.close()
-        outputChannel.close()
-
         // 停止并释放 MediaCodec
         mediaCodec?.let {
             try {
@@ -346,14 +466,9 @@ class AudioEncoder(
     }
 
     override fun stop() {
-        // 取消所有协程
-        inputJob?.cancel()
-        outputJob?.cancel()
+        // 取消编码器协程（会级联取消所有子协程和 Flow）
         encoderJob?.cancel()
-
-        // 关闭通道
-        inputChannel.close()
-        outputChannel.close()
+        encoderScope.cancel()
     }
 
     @Throws(InterruptedException::class)
@@ -399,11 +514,9 @@ class AudioEncoder(
             if (encoderName != null) {
                 Ln.d("Creating audio encoder by name: '$encoderName'")
                 try {
-                    // 1. 按名称创建编码器
                     val mediaCodec = MediaCodec.createByCodecName(encoderName)
-                    // 2. 获取支持的编码器类型
                     val mimeType = Codec.getMimeType(mediaCodec)
-                    // 3. 验证 MIME 类型是否匹配
+
                     if (codec.mimeType != mimeType) {
                         val message = "Audio encoder type for \"$encoderName\" " +
                                 "($mimeType) does not match codec type (${codec.mimeType})"
@@ -413,7 +526,6 @@ class AudioEncoder(
 
                     return mediaCodec
                 } catch (e: IllegalArgumentException) {
-                    // 编码器名称不存在
                     val message = """
                         Audio encoder '$encoderName' for ${codec.codecName} not found
                         ${buildAudioEncoderListMessage()}
@@ -421,7 +533,6 @@ class AudioEncoder(
                     Ln.e(message)
                     throw ConfigurationException("Unknown encoder: $encoderName")
                 } catch (e: IOException) {
-                    // 编码器创建失败(硬件问题)
                     val message = """
                         Could not create audio encoder '$encoderName' for ${codec.codecName}
                         ${buildAudioEncoderListMessage()}
@@ -431,7 +542,7 @@ class AudioEncoder(
                 }
             }
 
-            // 使用默认编码器 opus
+            // 使用默认编码器
             try {
                 val mediaCodec = MediaCodec.createEncoderByType(codec.mimeType!!)
                 Ln.d("Using audio encoder: '${mediaCodec.name}'")
