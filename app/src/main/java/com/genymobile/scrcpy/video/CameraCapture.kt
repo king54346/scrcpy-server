@@ -1,7 +1,6 @@
 package com.genymobile.scrcpy.video
 
 import android.annotation.SuppressLint
-import android.annotation.TargetApi
 import android.graphics.Rect
 import android.hardware.camera2.*
 import android.hardware.camera2.params.OutputConfiguration
@@ -21,21 +20,24 @@ import com.genymobile.scrcpy.device.Size
 import com.genymobile.scrcpy.opengl.AffineOpenGLFilter
 import com.genymobile.scrcpy.opengl.OpenGLRunner
 import com.genymobile.scrcpy.util.AffineMatrix
-import com.genymobile.scrcpy.util.HandlerExecutor
 import com.genymobile.scrcpy.util.Ln
 import com.genymobile.scrcpy.util.LogUtils
 import com.genymobile.scrcpy.wrappers.ServiceManager.cameraManager
+import kotlinx.coroutines.*
+import kotlinx.coroutines.android.asCoroutineDispatcher
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.*
 import java.io.IOException
-import java.util.concurrent.CompletableFuture
-import java.util.concurrent.ExecutionException
-import java.util.concurrent.Executor
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+import kotlin.coroutines.suspendCoroutine
 import kotlin.math.abs
 
 /**
- * 相机捕获实现
- * 使用 Camera2 API 捕获相机内容并编码为视频流
- * 支持高速录制、仿射变换、裁剪等功能
+ * 相机捕获实现 (Flow 版本)
+ * 使用 Camera2 API + Kotlin Coroutines + Flow 捕获相机内容并编码为视频流
+ * 支持高速录制、仿射变换、裁剪、事件流监听等功能
  */
 class CameraCapture(options: Options) : SurfaceCapture() {
 
@@ -63,42 +65,44 @@ class CameraCapture(options: Options) : SurfaceCapture() {
     private var transform: AffineMatrix? = null
     private var glRunner: OpenGLRunner? = null
 
-    // 相机线程和设备
-    private var cameraThread: HandlerThread? = null
-    private var cameraHandler: Handler? = null
+    // 协程相关
+    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    private val cameraThread = HandlerThread("camera").apply { start() }
+    private val cameraHandler = Handler(cameraThread.looper)
+    private val cameraDispatcher = cameraHandler.asCoroutineDispatcher()
+
+    // 相机设备和会话
     private var cameraDevice: CameraDevice? = null
-    private var cameraExecutor: Executor? = null
     private var captureSession: CameraCaptureSession? = null
 
     // 连接状态标志
     private val disconnected = AtomicBoolean(false)
 
+    // 捕获事件流
+    private var captureEventsFlow: Flow<CaptureEvent>? = null
+
     // ========== 生命周期方法 ==========
 
     /**
      * 初始化相机捕获
-     * 创建后台线程并打开相机设备
+     * 创建协程调度器并打开相机设备
      */
     @RequiresApi(Build.VERSION_CODES.S)
     @Throws(ConfigurationException::class, IOException::class)
     override fun init() {
-        // 创建专用相机线程
-        cameraThread = HandlerThread("camera").apply { start() }
-        cameraHandler = Handler(cameraThread!!.looper)
-        cameraExecutor = HandlerExecutor(cameraHandler!!)
+        runBlocking(cameraDispatcher) {
+            try {
+                // 选择并打开相机
+                cameraId = selectCamera(explicitCameraId, cameraFacing)
+                    ?: throw ConfigurationException("No matching camera found")
 
-        try {
-            // 选择并打开相机
-            cameraId = selectCamera(explicitCameraId, cameraFacing)
-                ?: throw ConfigurationException("No matching camera found")
-
-            Ln.i("Using camera '$cameraId'")
-            cameraDevice = openCamera(cameraId!!)
-        } catch (e: CameraAccessException) {
-            throw IOException("Failed to access camera", e)
-        } catch (e: InterruptedException) {
-            Thread.currentThread().interrupt()
-            throw IOException("Camera initialization interrupted", e)
+                Ln.i("Using camera '$cameraId'")
+                cameraDevice = openCameraAsync(cameraId!!)
+            } catch (e: CameraAccessException) {
+                throw IOException("Failed to access camera", e)
+            } catch (e: CancellationException) {
+                throw IOException("Camera initialization cancelled", e)
+            }
         }
     }
 
@@ -146,8 +150,6 @@ class CameraCapture(options: Options) : SurfaceCapture() {
             check(glRunner == null) { "OpenGL runner already initialized" }
 
             val glFilter = AffineOpenGLFilter(transform!!)
-            // Camera2 的 SurfaceTexture 变换矩阵不正确(通常包含额外的90°旋转)
-            // 使用垂直翻转矩阵代替
             glRunner = OpenGLRunner(glFilter, VFLIP_MATRIX)
 
             targetSurface = glRunner!!.start(
@@ -157,54 +159,66 @@ class CameraCapture(options: Options) : SurfaceCapture() {
             )
         }
 
-        try {
-            // 创建捕获会话并开始连续捕获
-            captureSession = targetSurface?.let {
-                createCaptureSession(
-                    cameraDevice ?: throw IOException("Camera device not initialized"),
-                    it
-                )
-            }
+        // 使用协程启动相机捕获并监听事件
+        scope.launch(cameraDispatcher) {
+            try {
+                // 创建捕获会话并开始连续捕获
+                captureSession = targetSurface?.let {
+                    createCaptureSessionAsync(
+                        cameraDevice ?: throw IOException("Camera device not initialized"),
+                        it
+                    )
+                }
 
-            val request = targetSurface?.let { createCaptureRequest(it) }
-            if (request != null) {
-                setRepeatingRequest(captureSession!!, request)
+                val request = targetSurface?.let { createCaptureRequest(it) }
+
+                // 启动捕获并收集事件流
+                captureEventsFlow = request?.let { createCaptureFlow(captureSession!!, it) }
+                captureEventsFlow?.collect { event ->
+                    handleCaptureEvent(event)
+                }
+            } catch (e: CameraAccessException) {
+                withContext(Dispatchers.Main) {
+                    stop()
+                }
+                throw IOException("Failed to start camera capture", e)
+            } catch (e: CancellationException) {
+                Ln.d("Camera capture cancelled")
+                throw e
             }
-        } catch (e: CameraAccessException) {
-            stop()
-            throw IOException("Failed to start camera capture", e)
-        } catch (e: InterruptedException) {
-            Thread.currentThread().interrupt()
-            stop()
-            throw IOException("Camera capture start interrupted", e)
         }
     }
 
     /**
      * 停止捕获
-     * 清理 OpenGL 资源
+     * 清理 OpenGL 资源和捕获会话
      */
     override fun stop() {
+        // 取消所有协程任务
+        scope.coroutineContext.cancelChildren()
+
         glRunner?.stopAndRelease()
         glRunner = null
 
         captureSession?.close()
         captureSession = null
+
+        captureEventsFlow = null
     }
 
     /**
      * 释放所有资源
-     * 关闭相机设备并退出后台线程
+     * 关闭相机设备并清理协程作用域
      */
     override fun release() {
+        scope.cancel()
+
         cameraDevice?.close()
         cameraDevice = null
 
-        cameraThread?.quitSafely()
-        cameraThread = null
-
-        cameraHandler = null
-        cameraExecutor = null
+        // 清理线程资源
+        cameraDispatcher.cancel()
+        cameraThread.quitSafely()
     }
 
     /**
@@ -226,28 +240,29 @@ class CameraCapture(options: Options) : SurfaceCapture() {
         // 相机镜像暂无控制器,不支持重置请求
     }
 
-    // ========== 相机操作私有方法 ==========
+    // ========== 相机操作私有方法(协程 + Flow 版本) ==========
 
     /**
-     * 打开相机设备
-     * 使用 CompletableFuture 等待异步回调完成
+     * 异步打开相机设备
+     * 使用 suspendCoroutine 将回调转换为挂起函数
      */
     @SuppressLint("MissingPermission")
     @RequiresApi(AndroidVersions.API_31_ANDROID_12)
-    @Throws(CameraAccessException::class, InterruptedException::class)
-    private fun openCamera(id: String): CameraDevice {
-        val future = CompletableFuture<CameraDevice>()
-
+    @Throws(CameraAccessException::class)
+    private suspend fun openCameraAsync(id: String): CameraDevice = suspendCoroutine { continuation ->
         val callback = object : CameraDevice.StateCallback() {
             override fun onOpened(camera: CameraDevice) {
                 Ln.d("Camera opened successfully")
-                future.complete(camera)
+                continuation.resume(camera)
             }
 
             override fun onDisconnected(camera: CameraDevice) {
                 Ln.w("Camera disconnected")
                 disconnected.set(true)
                 invalidate()
+                continuation.resumeWithException(
+                    CameraAccessException(CameraAccessException.CAMERA_DISCONNECTED, "Camera disconnected")
+                )
             }
 
             override fun onError(camera: CameraDevice, error: Int) {
@@ -258,37 +273,31 @@ class CameraCapture(options: Options) : SurfaceCapture() {
                     ERROR_CAMERA_DEVICE, ERROR_CAMERA_SERVICE -> CameraAccessException.CAMERA_ERROR
                     else -> CameraAccessException.CAMERA_ERROR
                 }
-                future.completeExceptionally(CameraAccessException(errorCode))
+                continuation.resumeWithException(CameraAccessException(errorCode))
             }
         }
 
-        cameraManager!!.openCamera(id, callback, cameraHandler)
-
-        return try {
-            future.get()
-        } catch (e: ExecutionException) {
-            throw e.cause as? CameraAccessException
-                ?: CameraAccessException(CameraAccessException.CAMERA_ERROR)
-        }
+        cameraManager!!.openCamera(id, callback, null)
     }
 
     /**
-     * 创建捕获会话
+     * 异步创建捕获会话
      * 支持普通和高速录制模式
      */
     @RequiresApi(AndroidVersions.API_31_ANDROID_12)
-    @Throws(CameraAccessException::class, InterruptedException::class)
-    private fun createCaptureSession(camera: CameraDevice, surface: Surface): CameraCaptureSession {
-        val future = CompletableFuture<CameraCaptureSession>()
-
+    @Throws(CameraAccessException::class)
+    private suspend fun createCaptureSessionAsync(
+        camera: CameraDevice,
+        surface: Surface
+    ): CameraCaptureSession = suspendCoroutine { continuation ->
         val callback = object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(session: CameraCaptureSession) {
-                future.complete(session)
+                continuation.resume(session)
             }
 
             override fun onConfigureFailed(session: CameraCaptureSession) {
-                future.completeExceptionally(
-                    CameraAccessException(CameraAccessException.CAMERA_ERROR)
+                continuation.resumeWithException(
+                    CameraAccessException(CameraAccessException.CAMERA_ERROR, "Session configuration failed")
                 )
             }
         }
@@ -302,18 +311,11 @@ class CameraCapture(options: Options) : SurfaceCapture() {
         val sessionConfig = SessionConfiguration(
             sessionType,
             listOf(OutputConfiguration(surface)),
-            cameraExecutor!!,
+            { it.run() },  // 使用同步执行器
             callback
         )
 
         camera.createCaptureSession(sessionConfig)
-
-        return try {
-            future.get()
-        } catch (e: ExecutionException) {
-            throw e.cause as? CameraAccessException
-                ?: CameraAccessException(CameraAccessException.CAMERA_ERROR)
-        }
     }
 
     /**
@@ -335,12 +337,14 @@ class CameraCapture(options: Options) : SurfaceCapture() {
     }
 
     /**
-     * 启动连续捕获
-     * 高速模式使用 burst 请求,普通模式使用单次请求
+     * 创建捕获事件流
+     * 使用 callbackFlow 将 Camera2 回调转换为 Flow
      */
     @RequiresApi(AndroidVersions.API_31_ANDROID_12)
-    @Throws(CameraAccessException::class, InterruptedException::class)
-    private fun setRepeatingRequest(session: CameraCaptureSession, request: CaptureRequest) {
+    private fun createCaptureFlow(
+        session: CameraCaptureSession,
+        request: CaptureRequest
+    ): Flow<CaptureEvent> = callbackFlow {
         val callback = object : CameraCaptureSession.CaptureCallback() {
             override fun onCaptureStarted(
                 session: CameraCaptureSession,
@@ -348,7 +352,17 @@ class CameraCapture(options: Options) : SurfaceCapture() {
                 timestamp: Long,
                 frameNumber: Long
             ) {
-                // 每帧捕获开始时调用(可用于性能监控)
+                // 发送帧开始事件
+                trySend(CaptureEvent.FrameStarted(frameNumber, timestamp))
+            }
+
+            override fun onCaptureCompleted(
+                session: CameraCaptureSession,
+                request: CaptureRequest,
+                result: TotalCaptureResult
+            ) {
+                // 发送帧完成事件
+                trySend(CaptureEvent.FrameCompleted(result.frameNumber, result))
             }
 
             override fun onCaptureFailed(
@@ -356,18 +370,63 @@ class CameraCapture(options: Options) : SurfaceCapture() {
                 request: CaptureRequest,
                 failure: CaptureFailure
             ) {
+                // 发送失败事件
                 Ln.w("Camera capture failed: frame ${failure.frameNumber}")
+                trySend(CaptureEvent.FrameFailed(failure.frameNumber, failure))
             }
         }
 
-        if (highSpeed) {
-            // 高速录制需要创建 burst 请求列表
-            val highSpeedSession = session as CameraConstrainedHighSpeedCaptureSession
-            val requests = highSpeedSession.createHighSpeedRequestList(request)
-            highSpeedSession.setRepeatingBurst(requests, callback, cameraHandler)
-        } else {
-            session.setRepeatingRequest(request, callback, cameraHandler)
+        // 启动重复捕获
+        try {
+            if (highSpeed) {
+                val highSpeedSession = session as CameraConstrainedHighSpeedCaptureSession
+                val requests = highSpeedSession.createHighSpeedRequestList(request)
+                highSpeedSession.setRepeatingBurst(requests, callback, null)
+            } else {
+                session.setRepeatingRequest(request, callback, null)
+            }
+        } catch (e: CameraAccessException) {
+            close(e)
         }
+
+        // 等待流关闭
+        awaitClose {
+            try {
+                session.stopRepeating()
+            } catch (e: CameraAccessException) {
+                Ln.e("Failed to stop repeating request: ${e.message}")
+            }
+        }
+    }.flowOn(cameraDispatcher)
+
+    /**
+     * 处理捕获事件
+     * 可以在这里添加帧率统计、性能监控等逻辑
+     */
+    private fun handleCaptureEvent(event: CaptureEvent) {
+        when (event) {
+            is CaptureEvent.FrameStarted -> {
+                // 可以记录帧开始时间用于性能分析
+            }
+            is CaptureEvent.FrameCompleted -> {
+                // 可以从 TotalCaptureResult 中提取元数据
+            }
+            is CaptureEvent.FrameFailed -> {
+                // 失败帧已经被记录,这里可以添加额外的错误处理
+            }
+        }
+    }
+
+    // ========== 捕获事件定义 ==========
+
+    /**
+     * 捕获事件密封类
+     * 表示相机捕获过程中的各种事件
+     */
+    private sealed class CaptureEvent {
+        data class FrameStarted(val frameNumber: Long, val timestamp: Long) : CaptureEvent()
+        data class FrameCompleted(val frameNumber: Long, val result: TotalCaptureResult) : CaptureEvent()
+        data class FrameFailed(val frameNumber: Long, val failure: CaptureFailure) : CaptureEvent()
     }
 
     // ========== 静态工具方法 ==========
