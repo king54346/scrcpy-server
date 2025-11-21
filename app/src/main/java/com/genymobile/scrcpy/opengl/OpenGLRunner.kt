@@ -15,7 +15,18 @@ import android.view.Surface
 import com.genymobile.scrcpy.device.Size
 import com.genymobile.scrcpy.opengl.GLUtils.checkGlError
 import java.util.concurrent.Semaphore
-
+// 接收 MediaCodec/MediaProjection 的输出，应用变换（如处理屏幕旋转），然后送给编码器进行视频编码和网络传输。
+//start() → 在 Handler 线程初始化 EGL
+//→ 创建 SurfaceTexture 和输入 Surface
+//→ 设置帧可用监听器
+//→ 返回输入 Surface 供上游写入
+//
+//每帧到达 → updateTexImage() 更新纹理
+//→ filter.draw() 应用滤镜处理
+//→ eglSwapBuffers() 输出到目标
+//
+//stopAndRelease() → 在 Handler 线程清理所有资源
+//通过 OpenGLFilter 进行图像处理（如旋转、缩放、滤镜）
 class OpenGLRunner @JvmOverloads constructor(
     private val filter: OpenGLFilter,
     private val overrideTransformMatrix: FloatArray? = null

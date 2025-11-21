@@ -15,6 +15,7 @@ import com.genymobile.scrcpy.opengl.AffineOpenGLFilter
 import com.genymobile.scrcpy.opengl.OpenGLRunner
 import com.genymobile.scrcpy.util.AffineMatrix
 import com.genymobile.scrcpy.util.Ln
+import com.genymobile.scrcpy.util.Ln.w
 import com.genymobile.scrcpy.wrappers.ServiceManager.displayManager
 import com.genymobile.scrcpy.wrappers.ServiceManager.windowManager
 import java.io.IOException

@@ -17,6 +17,7 @@ import com.genymobile.scrcpy.opengl.AffineOpenGLFilter
 import com.genymobile.scrcpy.opengl.OpenGLRunner
 import com.genymobile.scrcpy.util.AffineMatrix
 import com.genymobile.scrcpy.util.Ln
+import com.genymobile.scrcpy.util.Ln.w
 import com.genymobile.scrcpy.util.LogUtils
 import com.genymobile.scrcpy.wrappers.ServiceManager.displayManager
 import com.genymobile.scrcpy.wrappers.SurfaceControl
@@ -93,7 +94,6 @@ class ScreenCapture(
 
         val inputSize: Size
         val outputSurface: Surface?
-
         if (transform != null) {
             // 需要 OpenGL 滤镜处理
             inputSize = displayInfo!!.size
@@ -197,7 +197,7 @@ class ScreenCapture(
 
         val glFilter = AffineOpenGLFilter(transform!!)
         glRunner = OpenGLRunner(glFilter)
-
+        w("开启成功")
         return size?.let { outputSize ->
             surface?.let { glRunner!!.start(inputSize, outputSize, it) }
         }

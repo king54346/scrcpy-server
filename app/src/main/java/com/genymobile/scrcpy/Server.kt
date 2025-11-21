@@ -9,6 +9,8 @@ import com.genymobile.scrcpy.control.Controller
 import com.genymobile.scrcpy.device.*
 import com.genymobile.scrcpy.opengl.OpenGLRunner
 import com.genymobile.scrcpy.util.Ln
+import com.genymobile.scrcpy.util.Ln.e
+import com.genymobile.scrcpy.util.Ln.i
 import com.genymobile.scrcpy.util.LogUtils
 import com.genymobile.scrcpy.video.*
 import kotlinx.coroutines.*
@@ -222,6 +224,7 @@ object Server {
                         "Display ID must be specified"
                     }
                     // 捕获现有显示器
+                    i("捕获现有显示器${options.displayId}")
                     ScreenCapture(controller, options)
                 }
             }
