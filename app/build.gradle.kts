@@ -6,16 +6,25 @@ plugins {
 android {
     namespace = "com.genymobile.scrcpy"
     compileSdk = 35
-
+    ndkVersion = "27.1.12297006"  // 改成你实际有的版本
     defaultConfig {
         applicationId = "com.genymobile.scrcpy"
-        minSdk = 24
+        minSdk = 30
         targetSdk = 35
         versionCode=30303
         versionName="3.3.3"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-
+        ndk {
+            // 只保留 64 位架构
+            abiFilters.add("arm64-v8a")
+        }
+        externalNativeBuild {
+            cmake {
+                cppFlags.add("-std=c++17")
+                arguments.add("-DANDROID_STL=c++_shared")
+            }
+        }
     }
 
     buildTypes {
@@ -34,6 +43,12 @@ android {
     }
     kotlinOptions {
         jvmTarget = "11"
+    }
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
     buildFeatures {
         buildConfig = true
