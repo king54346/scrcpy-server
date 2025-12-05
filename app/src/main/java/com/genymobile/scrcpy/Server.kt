@@ -9,10 +9,10 @@ import com.genymobile.scrcpy.control.Controller
 import com.genymobile.scrcpy.device.*
 import com.genymobile.scrcpy.opengl.OpenGLRunner
 import com.genymobile.scrcpy.util.Ln
-import com.genymobile.scrcpy.util.Ln.e
 import com.genymobile.scrcpy.util.Ln.i
 import com.genymobile.scrcpy.util.LogUtils
 import com.genymobile.scrcpy.video.*
+import com.genymobile.scrcpy.vulkan.VulkanRunner
 import kotlinx.coroutines.*
 import java.io.File
 import java.io.IOException
@@ -281,8 +281,10 @@ object Server {
                 }
             },
             launch {
-                OpenGLRunner.quit()
-                OpenGLRunner.join()
+//                OpenGLRunner.quit()
+//                OpenGLRunner.join()
+                VulkanRunner.quit()
+                VulkanRunner.quit()
             },
             launch {
                 connection.shutdown()

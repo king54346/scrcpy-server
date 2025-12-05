@@ -20,6 +20,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.charset.StandardCharsets
 
+// 虚拟键盘等
 class UhidManager(private val sender: DeviceMessageSender, private val displayUniqueId: String?) {
     private val fds = ArrayMap<Int, FileDescriptor>()
     private val buffer: ByteBuffer =

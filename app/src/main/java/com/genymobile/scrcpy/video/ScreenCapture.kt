@@ -6,6 +6,7 @@ import android.os.Build
 import android.os.IBinder
 import android.view.Surface
 import com.genymobile.scrcpy.AndroidVersions
+import com.genymobile.scrcpy.FakeContext
 import com.genymobile.scrcpy.Options
 import com.genymobile.scrcpy.control.PositionMapper
 import com.genymobile.scrcpy.device.ConfigurationException
@@ -19,6 +20,8 @@ import com.genymobile.scrcpy.util.AffineMatrix
 import com.genymobile.scrcpy.util.Ln
 import com.genymobile.scrcpy.util.Ln.w
 import com.genymobile.scrcpy.util.LogUtils
+import com.genymobile.scrcpy.vulkan.AffineVulkanFilter
+import com.genymobile.scrcpy.vulkan.VulkanRunner
 import com.genymobile.scrcpy.wrappers.ServiceManager.displayManager
 import com.genymobile.scrcpy.wrappers.SurfaceControl
 import java.io.IOException
@@ -48,7 +51,8 @@ class ScreenCapture(
     // 监听器和渲染组件
     private val displaySizeMonitor = DisplaySizeMonitor()
     private var transform: AffineMatrix? = null
-    private var glRunner: OpenGLRunner? = null
+//    private var glRunner: OpenGLRunner? = null
+    private var vKRunner: VulkanRunner? = null
 
     // 虚拟显示器资源
     private var display: IBinder? = null
@@ -112,8 +116,8 @@ class ScreenCapture(
     }
 
     override fun stop() {
-        glRunner?.stopAndRelease()
-        glRunner = null
+        vKRunner?.stopAndRelease()
+        vKRunner = null
     }
 
     override fun release() {
@@ -192,17 +196,26 @@ class ScreenCapture(
     /**
      * 启动 OpenGL 处理管道
      */
+//    private fun startOpenGLPipeline(surface: Surface?, inputSize: Size): Surface? {
+//        require(glRunner == null) { "OpenGL runner already exists" }
+//
+//        val glFilter = AffineOpenGLFilter(transform!!)
+//        glRunner = OpenGLRunner(glFilter)
+//        w("开启成功")
+//        return size?.let { outputSize ->
+//            surface?.let { glRunner!!.start(inputSize, outputSize, it) }
+//        }
+//    }
     private fun startOpenGLPipeline(surface: Surface?, inputSize: Size): Surface? {
-        require(glRunner == null) { "OpenGL runner already exists" }
+        require(vKRunner == null) { "OpenGL runner already exists" }
 
-        val glFilter = AffineOpenGLFilter(transform!!)
-        glRunner = OpenGLRunner(glFilter)
+        val glFilter = AffineVulkanFilter(FakeContext.get(), transform!!)
+        vKRunner = VulkanRunner(glFilter)
         w("开启成功")
         return size?.let { outputSize ->
-            surface?.let { glRunner!!.start(inputSize, outputSize, it) }
+            surface?.let { vKRunner!!.start(inputSize, outputSize, it) }
         }
     }
-
     /**
      * 创建虚拟显示器,失败时使用 SurfaceControl 备用方案
      */

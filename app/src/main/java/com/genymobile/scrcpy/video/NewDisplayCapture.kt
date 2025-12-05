@@ -7,6 +7,7 @@ import android.os.Build
 import android.view.Surface
 import androidx.annotation.RequiresApi
 import com.genymobile.scrcpy.AndroidVersions
+import com.genymobile.scrcpy.FakeContext
 import com.genymobile.scrcpy.Options
 import com.genymobile.scrcpy.control.PositionMapper
 import com.genymobile.scrcpy.device.Orientation
@@ -16,6 +17,8 @@ import com.genymobile.scrcpy.opengl.OpenGLRunner
 import com.genymobile.scrcpy.util.AffineMatrix
 import com.genymobile.scrcpy.util.Ln
 import com.genymobile.scrcpy.util.Ln.w
+import com.genymobile.scrcpy.vulkan.AffineVulkanFilter
+import com.genymobile.scrcpy.vulkan.VulkanRunner
 import com.genymobile.scrcpy.wrappers.ServiceManager.displayManager
 import com.genymobile.scrcpy.wrappers.ServiceManager.windowManager
 import java.io.IOException
@@ -60,6 +63,7 @@ class NewDisplayCapture(
     private var displayTransform: AffineMatrix? = null
     private var eventTransform: AffineMatrix? = null
     private var glRunner: OpenGLRunner? = null
+    private var vkRunner: VulkanRunner? = null
 
     // === 虚拟显示器 ===
     private var virtualDisplay: VirtualDisplay? = null
@@ -95,8 +99,8 @@ class NewDisplayCapture(
     }
     // 实现关闭
     override fun stop() {
-        glRunner?.stopAndRelease()
-        glRunner = null
+        vkRunner?.stopAndRelease()
+        vkRunner = null
     }
     //
     override fun release() {
@@ -265,16 +269,16 @@ class NewDisplayCapture(
         //  创建OpenGL渲染器来处理图形变换
         return if (displayTransform != null) {
             // 1. 检查GL运行器是否已存在（防止重复创建）
-            check(glRunner == null) { "GL runner already exists" }
+            check(vkRunner == null) { "GL runner already exists" }
             // 2. 创建仿射变换的OpenGL过滤器
-            val glFilter = AffineOpenGLFilter(displayTransform!!)
-            glRunner = OpenGLRunner(glFilter)
+            val glFilter = AffineVulkanFilter(FakeContext.get(),displayTransform!!)
+            vkRunner = VulkanRunner(glFilter)
             // 3. 验证必要的参数不为空
             requireNotNull(physicalSize)
             requireNotNull(size)
             requireNotNull(surface)
             // 4. 启动GL运行器，返回GL运行器内部的Surface
-            glRunner!!.start(physicalSize!!, size!!, surface)
+            vkRunner!!.start(physicalSize!!, size!!, surface)
         } else {
             surface
         }

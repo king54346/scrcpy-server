@@ -15,7 +15,9 @@ import android.view.Surface
 import com.genymobile.scrcpy.device.Size
 import com.genymobile.scrcpy.opengl.GLUtils.checkGlError
 import java.util.concurrent.Semaphore
-// 接收 MediaCodec/MediaProjection 的输出，应用变换（如处理屏幕旋转），然后送给编码器进行视频编码和网络传输。
+
+//它接收一个输入视频流（Input Surface），应用某种滤镜或效果（OpenGLFilter），然后将其渲染到输出端（Output Surface，比如屏幕或视频编码器）。
+
 //start() → 在 Handler 线程初始化 EGL
 //→ 创建 SurfaceTexture 和输入 Surface
 //→ 设置帧可用监听器
@@ -140,7 +142,7 @@ class OpenGLRunner @JvmOverloads constructor(
         GLES20.glGenTextures(1, textures, 0)
         checkGlError()
         textureId = textures[0]
-
+        // OpenGL 创建的是 GL_TEXTURE_EXTERNAL_OES 纹理
         GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
         checkGlError()
         GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
@@ -149,7 +151,7 @@ class OpenGLRunner @JvmOverloads constructor(
         checkGlError()
         GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
         checkGlError()
-
+        // 关键：SurfaceTexture 绑定到 OpenGL 纹理
         surfaceTexture = SurfaceTexture(textureId)
         surfaceTexture!!.setDefaultBufferSize(inputSize.width, inputSize.height)
         inputSurface = Surface(surfaceTexture)
